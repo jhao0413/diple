@@ -9,9 +9,9 @@ use std::io::Write;
 #[cfg(unix)]
 use std::process::Stdio;
 
+use anyhow::Result;
 #[cfg(unix)]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{Context, bail};
 
 use crate::model::Comment;
 
@@ -89,7 +89,8 @@ impl ExportTarget for Clipboard {
 
 #[cfg(windows)]
 fn export_clipboard(text: &str) -> Result<()> {
-    clipboard_win::set_clipboard_string(text).context("setting the Windows clipboard")
+    clipboard_win::set_clipboard_string(text)
+        .map_err(|error| anyhow::anyhow!("setting the Windows clipboard: {error:?}"))
 }
 
 #[cfg(unix)]

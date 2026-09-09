@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use herdr_reviewr::app::App;
-use herdr_reviewr::model::Scope;
+use diple::app::App;
+use diple::model::Scope;
 use tempfile::TempDir;
 
 pub struct Repo {
@@ -37,9 +37,9 @@ impl Repo {
     pub fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> String {
         let out = Command::new("git")
             .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
+            .env("GIT_AUTHOR_EMAIL", "test@diple.test")
             .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@herdr.test")
+            .env("GIT_COMMITTER_EMAIL", "test@diple.test")
             .envs(env.iter().copied())
             .arg("-C")
             .arg(self.path())
@@ -83,19 +83,7 @@ impl Repo {
     /// Record `content` as the base-pick blob verbatim, bypassing `write_base_pick` — for
     /// the values only a foreign writer could put on this worktree's pick ref.
     pub fn write_raw_base_pick(&self, content: &str) {
-        self.plant_blob("refs/worktree/reviewr/base-pick", content);
-    }
-
-    /// A leftover clone-wide pick from before the worktree-private cutover.
-    pub fn plant_legacy_base_pick(&self, content: &str) {
-        self.plant_blob("refs/reviewr/base-pick", content);
-    }
-
-    /// A leftover path-hashed last-turn ref from before the worktree-private cutover,
-    /// using the FNV-1a key the old binary wrote.
-    pub fn plant_legacy_turn_base(&self, sha: &str) {
-        let key = legacy_worktree_key(self.path());
-        self.git(&["update-ref", &format!("refs/reviewr/turn-base/{key}"), sha]);
+        self.plant_blob("refs/worktree/diple/base-pick", content);
     }
 
     /// A linked worktree of this clone on a new branch. Lives as long as the returned value.
@@ -137,15 +125,6 @@ impl LinkedWorktree {
     }
 }
 
-fn legacy_worktree_key(repo: &Path) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in repo.to_string_lossy().bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
 pub fn app_on(repo: &Repo) -> App {
     let mut app = App::new(repo.path_buf(), Scope::Uncommitted, None);
     app.reload().unwrap();
@@ -161,8 +140,8 @@ pub fn typed(app: &mut App, text: &str) {
 /// A minimal open-PR snapshot. Tests override only the fields they exercise:
 /// `PrSnapshot { comments, ..common::pr_snapshot() }` — so a new snapshot field
 /// touches this one literal instead of every test.
-pub fn pr_snapshot() -> herdr_reviewr::forge::PrSnapshot {
-    use herdr_reviewr::forge::{Merge, PrSnapshot, PrState, Sync};
+pub fn pr_snapshot() -> diple::forge::PrSnapshot {
+    use diple::forge::{Merge, PrSnapshot, PrState, Sync};
     PrSnapshot {
         number: 1,
         title: "t".into(),
@@ -184,8 +163,8 @@ pub fn pr_snapshot() -> herdr_reviewr::forge::PrSnapshot {
 
 /// A minimal PR conversation comment. Tests override the fields they exercise:
 /// `Comment { body: "...".into(), ..common::comment() }`.
-pub fn comment() -> herdr_reviewr::forge::Comment {
-    use herdr_reviewr::forge::{Comment, CommentKind};
+pub fn comment() -> diple::forge::Comment {
+    use diple::forge::{Comment, CommentKind};
     Comment {
         kind: CommentKind::Comment,
         author: "ann".into(),
@@ -203,14 +182,14 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
 
 /// Switch to `tab` and service the deferred reload the switch schedules, so assertions run
 /// against the freshly reloaded state — the same sequence the event loop performs.
-pub fn enter_tab(app: &mut App, tab: herdr_reviewr::app::Tab) {
+pub fn enter_tab(app: &mut App, tab: diple::app::Tab) {
     app.set_tab(tab).unwrap();
     land_world(app);
 }
 
 /// Land the queued world refresh synchronously, as the worker's completion would.
 pub fn land_world(app: &mut App) {
-    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let snapshot = diple::world::build(&app.world_input()).unwrap();
     app.reconcile_world(snapshot);
     app.world_request = None;
 }

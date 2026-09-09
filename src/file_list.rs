@@ -8,7 +8,23 @@
 use std::collections::{BTreeMap, HashSet};
 use std::hash::BuildHasher;
 
-use crate::model::{ChangeKind, ChangedFile};
+use crate::model::{ChangeKind, ChangedFile, StatusCode};
+
+/// The index or worktree section of the uncommitted changes list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListGroup {
+    Staged,
+    Working,
+}
+
+impl ListGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Staged => "Staged Changes",
+            Self::Working => "Changes",
+        }
+    }
+}
 
 /// A visible row of the flattened tree: a directory or a file.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -30,6 +46,8 @@ pub enum RowKind {
     Dir { path: String, expanded: bool },
     /// A file: its index into the source `&[Entry]`, plus its annotation when changed.
     File { index: usize, annotation: Option<Annotation> },
+    /// A non-selectable section header.
+    Group { label: String, count: usize },
 }
 
 /// The change a file carries in the active scope, shown inline in the tree. Absent on an
@@ -39,13 +57,19 @@ pub struct Annotation {
     pub change: ChangeKind,
     pub additions: u32,
     pub deletions: u32,
+    pub status_code: Option<StatusCode>,
 }
 
 impl From<&ChangedFile> for Annotation {
     /// The scope annotation a changed file carries — the one mapping, shared by the `Changes`
     /// entry build and `app.rs`'s changeset map so a new field can't be wired in one and missed.
     fn from(f: &ChangedFile) -> Self {
-        Self { change: f.kind, additions: f.additions, deletions: f.deletions }
+        Self {
+            change: f.kind,
+            additions: f.additions,
+            deletions: f.deletions,
+            status_code: f.status_code,
+        }
     }
 }
 
@@ -61,6 +85,7 @@ pub struct Entry {
     /// A wholly-ignored directory placeholder whose children load lazily on expand; never
     /// set on a `Changes` entry.
     pub is_dir: bool,
+    pub group: Option<ListGroup>,
 }
 
 impl Entry {
@@ -72,6 +97,7 @@ impl Entry {
             annotation: Some(Annotation::from(f)),
             ignored: false,
             is_dir: false,
+            group: None,
         }
     }
 }
@@ -81,7 +107,7 @@ impl Row {
     pub fn file_index(&self) -> Option<usize> {
         match self.kind {
             RowKind::File { index, .. } => Some(index),
-            RowKind::Dir { .. } => None,
+            RowKind::Dir { .. } | RowKind::Group { .. } => None,
         }
     }
 
@@ -89,7 +115,7 @@ impl Row {
     pub fn dir_path(&self) -> Option<&str> {
         match &self.kind {
             RowKind::Dir { path, .. } => Some(path),
-            RowKind::File { .. } => None,
+            RowKind::File { .. } | RowKind::Group { .. } => None,
         }
     }
 }
@@ -115,8 +141,37 @@ pub fn build<S: BuildHasher>(
     toggled: &HashSet<String, S>,
     default_expanded: bool,
 ) -> Vec<Row> {
+    if entries.iter().any(|entry| entry.group.is_some()) {
+        let mut rows = Vec::new();
+        for group in [ListGroup::Staged, ListGroup::Working] {
+            let count = entries.iter().filter(|entry| entry.group == Some(group)).count();
+            if count == 0 {
+                continue;
+            }
+            rows.push(Row {
+                depth: 0,
+                name: String::new(),
+                kind: RowKind::Group { label: group.label().to_string(), count },
+                ignored: false,
+            });
+            rows.extend(build_tree(entries, Some(group), toggled, default_expanded));
+        }
+        return rows;
+    }
+    build_tree(entries, None, toggled, default_expanded)
+}
+
+fn build_tree<S: BuildHasher>(
+    entries: &[Entry],
+    group: Option<ListGroup>,
+    toggled: &HashSet<String, S>,
+    default_expanded: bool,
+) -> Vec<Row> {
     let mut root = Dir::default();
     for (i, e) in entries.iter().enumerate() {
+        if e.group != group {
+            continue;
+        }
         insert(&mut root, e, i);
     }
     let mut rows = Vec::new();
@@ -214,7 +269,7 @@ fn join(prefix: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Annotation, Entry, RowKind, build};
+    use super::{Annotation, Entry, ListGroup, RowKind, build};
     use crate::model::{ChangeKind, ChangedFile};
     use std::collections::HashSet;
 
@@ -225,6 +280,8 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous_path: None,
+            status_code: None,
+            stage_stats: None,
         }
     }
 
@@ -315,9 +372,37 @@ mod tests {
             annotation: None,
             ignored: false,
             is_dir: false,
+            group: None,
         };
         let rows = build(&[entry], &HashSet::new(), false);
         assert!(matches!(rows[0].kind, RowKind::File { annotation: None, .. }));
+    }
+
+    #[test]
+    fn staged_and_working_sections_can_show_the_same_path() {
+        let grouped = |group| Entry {
+            path: "src/lib.rs".into(),
+            previous_path: None,
+            annotation: None,
+            ignored: false,
+            is_dir: false,
+            group: Some(group),
+        };
+        let rows = build(
+            &[grouped(ListGroup::Working), grouped(ListGroup::Staged)],
+            &HashSet::new(),
+            true,
+        );
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::Group { label, count: 1 } if label == "Staged Changes"
+        ));
+        assert_eq!(rows[1].file_index(), Some(1));
+        assert!(matches!(
+            &rows[2].kind,
+            RowKind::Group { label, count: 1 } if label == "Changes"
+        ));
+        assert_eq!(rows[3].file_index(), Some(0));
     }
 
     fn ignored_dir(path: &str) -> Entry {
@@ -327,6 +412,7 @@ mod tests {
             annotation: None,
             ignored: true,
             is_dir: true,
+            group: None,
         }
     }
 
@@ -348,6 +434,7 @@ mod tests {
             annotation: None,
             ignored: true,
             is_dir: false,
+            group: None,
         };
         let rows = build(&[entry], &HashSet::new(), false);
         assert!(rows[0].ignored, "an ignored file row is dimmed");

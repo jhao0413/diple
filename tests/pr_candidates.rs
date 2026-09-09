@@ -6,11 +6,9 @@
 mod common;
 
 use common::Repo;
-use herdr_reviewr::config::{PluginConfig, plugin_config_in};
-use herdr_reviewr::forge::{Association, PrInputError, assoc_history, fetch_input, resolve_pick};
-use herdr_reviewr::git::{
-    GitFail, PrLocalState, RepositoryIdentity, ahead_behind_oids, contains_commit,
-};
+use diple::config::{AppConfig, app_config_in};
+use diple::forge::{Association, PrInputError, assoc_history, fetch_input, resolve_pick};
+use diple::git::{GitFail, PrLocalState, RepositoryIdentity, ahead_behind_oids, contains_commit};
 use std::io::Write;
 use std::path::Path;
 
@@ -33,12 +31,12 @@ fn head(repo: &Repo) -> String {
     repo.git(&["rev-parse", "HEAD"]).trim().to_string()
 }
 
-fn defaults() -> PluginConfig {
-    PluginConfig::default()
+fn defaults() -> AppConfig {
+    AppConfig::default()
 }
 
 fn pr_local(repo: &Path, base: Option<&str>) -> Result<PrLocalState, GitFail> {
-    herdr_reviewr::git::pr_local(repo, base)
+    diple::git::pr_local(repo, base)
 }
 
 fn assert_target(identity: &RepositoryIdentity, host: &str, owner: &str, name: &str) {
@@ -109,7 +107,7 @@ fn a_github_com_prefixed_host_is_only_supported_when_configured_literally() {
     let config_dir = tempfile::tempdir().unwrap();
     std::fs::write(config_dir.path().join("config.toml"), "github_host = \"github.com-work\"\n")
         .unwrap();
-    let config = plugin_config_in(config_dir.path()).unwrap();
+    let config = app_config_in(config_dir.path()).unwrap();
     let input = fetch_input(repo.path(), None, &config).unwrap();
     assert_target(&input.repository, "github.com-work", "enterprise", "widgets");
 }
@@ -188,7 +186,7 @@ fn every_resolved_base_source_excludes_names() {
     // The worktree parks at main's tip with zero work of its own.
     repo.git(&["switch", "-qC", "work", "main"]);
 
-    herdr_reviewr::git::write_base_pick(repo.path(), "develop").unwrap();
+    diple::git::write_base_pick(repo.path(), "develop").unwrap();
     let local = pr_local(repo.path(), None).expect("pr_local");
     let develop_tip = repo.git(&["rev-parse", "origin/develop"]).trim().to_string();
     assert_eq!(local.base_oid.as_deref(), Some(develop_tip.as_str()), "develop wins the pin");
@@ -200,7 +198,7 @@ fn a_dormant_pick_still_shields_its_name() {
     // The picked `develop` was never created, so it resolves to nothing, but the record stands:
     // an upstream naming it is still tracking a base, not publishing to it
     let repo = worktree();
-    herdr_reviewr::git::write_base_pick(repo.path(), "develop").unwrap();
+    diple::git::write_base_pick(repo.path(), "develop").unwrap();
     repo.git(&["config", "branch.work.remote", "origin"]);
     repo.git(&["config", "branch.work.merge", "refs/heads/develop"]);
 
@@ -437,7 +435,7 @@ fn fetch_input_uses_instead_of_rewrite_and_ignores_pushurl() {
     let config_dir = tempfile::tempdir().unwrap();
     std::fs::write(config_dir.path().join("config.toml"), "github_host = \"github.company.com\"\n")
         .unwrap();
-    let config = plugin_config_in(config_dir.path()).unwrap();
+    let config = app_config_in(config_dir.path()).unwrap();
     let input = fetch_input(repo.path(), None, &config).expect("fetch input");
     assert_target(&input.repository, "github.company.com", "owner", "repo");
 }
@@ -461,7 +459,7 @@ fn fetch_input_changes_only_with_derived_query_state() {
     assert_ne!(head_changed, names_changed);
 
     // A base pick on this worktree changes the input.
-    herdr_reviewr::git::write_base_pick(repo.path(), "work").unwrap();
+    diple::git::write_base_pick(repo.path(), "work").unwrap();
     let base_changed = fetch_input(repo.path(), None, &defaults()).unwrap();
     assert_ne!(base_changed, head_changed);
 }

@@ -1,6 +1,6 @@
 {
  "meta": {
-  "binary": "target/release/herdr-reviewr",
+  "binary": "target/release/diple",
   "binary_mtime": 1787154556,
   "source_rev": "a422454",
   "cols": 160,
@@ -11,7 +11,7 @@
  "runs": [
   {
    "label": "fixture",
-   "repo": "/var/folders/1g/qfv0jsqj5jl2y1npdksp1zyr0000gn/T/reviewr-bench-fixture",
+   "repo": "/var/folders/1g/qfv0jsqj5jl2y1npdksp1zyr0000gn/T/Diple-bench-fixture",
    "iterations": 10,
    "results": [
     {

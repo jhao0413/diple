@@ -12,6 +12,7 @@ pub enum Action {
     PrevHunk,
     NextFile,
     PrevFile,
+    ToggleStage,
     Collapse,
     Expand,
     PageUp,
@@ -20,7 +21,6 @@ pub enum Action {
     HalfDown,
     ScopeUncommitted,
     ScopeBranch,
-    ScopeLastTurn,
     ScopeCommits,
     BasePick,
     CommitPick,
@@ -140,7 +140,7 @@ impl Key {
         }
     }
 
-    /// The spelling `[keybindings]` and `--resolve-plugin-config` round-trip: `ctrl+f`,
+    /// The spelling used in `[keybindings]` round-trips: `ctrl+f`,
     /// `alt+x`, the bare character, or a named key's lowercase name.
     /// There is deliberately no `Display` impl: a call site must pick this or [`Self::label`].
     pub fn config_str(self) -> String {
@@ -163,6 +163,7 @@ const ACTIONS: [(Action, &str, &[Key]); 42] = [
     (Action::PrevHunk, "prev-hunk", &[Key::plain('[')]),
     (Action::NextFile, "next-file", &[Key::plain('f')]),
     (Action::PrevFile, "prev-file", &[Key::plain('F')]),
+    (Action::ToggleStage, "toggle-stage", &[Key::plain('a')]),
     (Action::Collapse, "collapse", &[Key::named(KeyCode::Left)]),
     (Action::Expand, "expand", &[Key::named(KeyCode::Right)]),
     (Action::PageUp, "page-up", &[Key::named(KeyCode::PageUp)]),
@@ -171,7 +172,6 @@ const ACTIONS: [(Action, &str, &[Key]); 42] = [
     (Action::HalfDown, "half-down", &[Key::ctrl('d')]),
     (Action::ScopeUncommitted, "scope-uncommitted", &[Key::plain('u')]),
     (Action::ScopeBranch, "scope-branch", &[Key::plain('b')]),
-    (Action::ScopeLastTurn, "scope-last-turn", &[Key::plain('t')]),
     (Action::ScopeCommits, "scope-commits", &[Key::plain('g')]),
     (Action::BasePick, "base-pick", &[Key::plain('B')]),
     (Action::CommitPick, "commit-pick", &[Key::plain('G')]),

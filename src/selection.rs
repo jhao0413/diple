@@ -121,6 +121,7 @@ pub fn files_text(
         .filter_map(|r| match &r.kind {
             RowKind::Dir { path, .. } => Some(path.clone()),
             RowKind::File { index, .. } => entries.get(*index).map(|e| e.path.clone()),
+            RowKind::Group { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -258,6 +259,7 @@ mod tests {
             annotation: None,
             ignored: false,
             is_dir: false,
+            group: None,
         }];
         let rows = vec![
             FileRow {

@@ -1,7 +1,7 @@
-//! herdr-reviewr — a herdr-native review pane.
+//! Diple — an independent terminal code-review workbench.
 //!
-//! Browse an agent's changes (uncommitted / branch), leave line-range comments,
-//! and send them back to the agent (or the clipboard) — entirely in a herdr pane.
+//! Browse changes, leave line-range comments, and emit a structured review that can be
+//! piped into any tool or copied to the clipboard.
 //!
 //! This crate is split into a thin binary (`src/main.rs`) and this library so the
 //! interaction logic in [`app`] stays terminal-free and unit-testable. This module
@@ -19,7 +19,6 @@ pub mod file_list;
 pub mod forge;
 pub mod git;
 pub mod gitlab;
-pub mod herdr;
 pub mod highlight;
 pub mod keymap;
 #[macro_use]
@@ -31,11 +30,10 @@ pub mod search;
 pub mod selection;
 pub mod snippet;
 pub mod theme;
-pub mod turn;
 pub mod ui;
 pub mod world;
 
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -43,7 +41,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::DefaultTerminal;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
@@ -59,14 +58,40 @@ use ratatui::layout::Rect;
 use std::process::Stdio;
 
 use crate::app::{App, Focus, Mode};
-use crate::config::{Config, PluginConfig};
+use crate::config::{AppConfig, Config};
 use crate::export::Clipboard;
 use crate::keymap::Keymap;
 use crate::model::Scope;
 
-/// The status-line note a slow config-dir lookup paints before its answer swaps the frame,
-/// and retracts if the lookup resolves nothing (`policies/ux-responsiveness.md`).
-const RESOLVING_NOTE: &str = "resolving plugin config…";
+type DipleTerminal = Terminal<CrosstermBackend<Box<dyn Write + Send>>>;
+
+/// Keep terminal control bytes away from captured stdout so stdout can be Diple's result channel.
+fn open_tui_writer() -> io::Result<Box<dyn Write + Send>> {
+    if io::stdout().is_terminal() {
+        return Ok(Box::new(io::stdout()));
+    }
+    #[cfg(unix)]
+    {
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map(|file| Box::new(file) as Box<dyn Write + Send>);
+    }
+    #[cfg(windows)]
+    {
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONOUT$")
+            .map(|file| Box::new(file) as Box<dyn Write + Send>);
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "stdout is captured and no controlling terminal is available",
+    ))
+}
 
 /// Entry point: parse config, set up the terminal, run the loop, restore.
 pub fn run() -> Result<()> {
@@ -74,63 +99,32 @@ pub fn run() -> Result<()> {
     log::init();
     // The config directory resolves once, at startup; every later read rereads only the
     // file inside it. Only the environment names it here: the CLI
-    // fallback is a herdr subprocess, so it waits until after the first paint below —
-    // a wedged herdr must never hold the paint (issue #4).
-    cfg.plugin_config_dir = config::resolve_config_dir(|| None);
-    let mut initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
+    // fallback is a Diple subprocess, so it waits until after the first paint below —
+    // a wedged Diple must never hold the paint (issue #4).
+    cfg.config_dir = config::resolve_config_dir();
+    let initial_config = config::app_config(cfg.config_dir.as_deref());
     let mut app = app_for(&cfg, &initial_config);
 
-    let mut terminal = ratatui::init();
+    let mut tui_writer = open_tui_writer()?;
+    enable_raw_mode()?;
+    execute!(tui_writer, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(tui_writer))?;
     // The kitty keyboard protocol reports modifiers on keys the legacy encoding drops — most
     // notably Ctrl/Alt+arrows — so word-jump by arrow works where the terminal supports it.
-    let kbd = supports_keyboard_enhancement().unwrap_or(false);
+    // The capability query itself writes to stdout, so skip it when stdout is the result pipe.
+    let kbd = io::stdout().is_terminal() && supports_keyboard_enhancement().unwrap_or(false);
     logln!("keyboard enhancement supported={kbd}");
     // `ratatui::init` already claimed the alternate screen and raw mode, so only the input
     // modes are left to claim here.
-    claim_input_modes(kbd);
-    // Render before the first load, so a slow, failing, or hung `git` scan shows the reviewr UI
-    // instead of the blank pane herdr leaves when the process blocks or exits before it renders
+    claim_input_modes(&mut terminal, kbd);
+    // Render before the first load, so a slow, failing, or hung `git` scan shows the Diple UI
+    // instead of the blank pane Diple leaves when the process blocks or exits before it renders
     // (issue #4). Paint the empty frame first; then the initial load, non-fatal — an error
     // opens the pane with the reason in the status line, the same contract as a failed poll
     // refresh.
     if let Err(error) = terminal.draw(|f| ui::render(f, &app)) {
-        restore_terminal(kbd);
+        restore_terminal(&mut terminal, kbd);
         return Err(error.into());
-    }
-    // The cosmetic pane label, stamped after the first paint and cleared on a normal exit
-    // Display only: identity is the process.
-    herdr::label_pane();
-    // The CLI half of config-dir resolution, on a painted pane: with no environment
-    // directory, ask herdr and rebuild from the directory it names. Nothing user-held
-    // exists yet — the rebuild happens before the first load — and a wedged herdr
-    // degrades this pane to the defaults instead of holding herdr's blank grid
-    // (issue #4). A slow answer paints its note
-    // first, so the config swap is never a silent stale-then-swap; a fast one shows
-    // nothing (`policies/ux-responsiveness.md`).
-    let cli_dir = cfg
-        .plugin_config_dir
-        .is_none()
-        .then(|| {
-            herdr::plugin_config_dir_with(|| {
-                app.status = RESOLVING_NOTE.into();
-                let _ = terminal.draw(|f| ui::render(f, &app));
-            })
-        })
-        .flatten();
-    if let Some(dir) = cli_dir {
-        cfg.plugin_config_dir = Some(dir.into());
-        initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
-        app = app_for(&cfg, &initial_config);
-        if let Err(error) = terminal.draw(|f| ui::render(f, &app)) {
-            restore_terminal(kbd);
-            herdr::clear_pane_label();
-            return Err(error.into());
-        }
-    }
-    // A slow lookup that then resolved nothing leaves its note behind; retract it.
-    if app.status == RESOLVING_NOTE {
-        app.status.clear();
-        let _ = terminal.draw(|f| ui::render(f, &app));
     }
     if initial_config.is_ok()
         && let Err(e) = app.reload()
@@ -139,8 +133,11 @@ pub fn run() -> Result<()> {
         app.status = format!("load failed: {e}");
     }
     let result = event_loop(&mut terminal, &mut app, &cfg, kbd);
-    herdr::clear_pane_label();
-    result
+    result?;
+    if let Some(review) = app.send_output.take() {
+        println!("{review}");
+    }
+    Ok(())
 }
 
 /// Claim the input modes the event loop reads, on a screen something else already owns.
@@ -148,22 +145,24 @@ pub fn run() -> Result<()> {
 /// Bracketed paste so a multi-line paste arrives as one event, not raw keystrokes whose
 /// embedded newlines would submit the comment early. The kitty keyboard protocol reports
 /// modifiers on keys the legacy encoding drops, most notably Ctrl/Alt+arrows.
-fn claim_input_modes(kbd: bool) {
-    let _ = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste, cursor::Hide);
+fn claim_input_modes(terminal: &mut DipleTerminal, kbd: bool) {
+    let _ =
+        execute!(terminal.backend_mut(), EnableMouseCapture, EnableBracketedPaste, cursor::Hide);
     if kbd {
         let _ = execute!(
-            io::stdout(),
+            terminal.backend_mut(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
 }
 
 /// Release what [`claim_input_modes`] claimed.
-fn release_input_modes(kbd: bool) {
+fn release_input_modes(terminal: &mut DipleTerminal, kbd: bool) {
     if kbd {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, cursor::Show);
+    let _ =
+        execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, cursor::Show);
 }
 
 /// Claim the screen as well as the input modes. The exact inverse of [`release_terminal`], for
@@ -171,24 +170,23 @@ fn release_input_modes(kbd: bool) {
 ///
 /// Startup does not use this pair: `ratatui::init` already owns the alternate screen and raw
 /// mode there, and claiming either twice is not the no-op it looks like.
-fn claim_terminal(kbd: bool) {
+fn claim_terminal(terminal: &mut DipleTerminal, kbd: bool) {
     let _ = enable_raw_mode();
-    let _ = execute!(io::stdout(), EnterAlternateScreen);
-    claim_input_modes(kbd);
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    claim_input_modes(terminal, kbd);
 }
 
 /// Release everything [`claim_terminal`] claimed, leaving a plain terminal another program can
 /// own outright.
-fn release_terminal(kbd: bool) {
-    release_input_modes(kbd);
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+fn release_terminal(terminal: &mut DipleTerminal, kbd: bool) {
+    release_input_modes(terminal, kbd);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
 
 /// Leave the alternate screen and release terminal input modes before any bounded worker drain.
-fn restore_terminal(kbd: bool) {
-    release_input_modes(kbd);
-    ratatui::restore();
+fn restore_terminal(terminal: &mut DipleTerminal, kbd: bool) {
+    release_terminal(terminal, kbd);
 }
 
 /// Take back the input stream an external program left behind.
@@ -217,9 +215,9 @@ fn drain_input(app: &mut App) -> Result<()> {
 /// A terminal editor owns the pane outright: it suspends down to a plain terminal, and the
 /// return rebuilds the same mode stack and refreshes the changeset. A window editor is opened
 /// and forgotten, so the pane never moves and the poll shows the writes like any other change
-/// to the worktree (Continuity). reviewr itself still writes nothing.
+/// to the worktree (Continuity). Diple itself still writes nothing.
 fn run_editor(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut DipleTerminal,
     app: &mut App,
     configured: Option<&str>,
     kbd: bool,
@@ -241,7 +239,7 @@ fn run_editor(
         Ok(command) => command,
         // Two causes, and the second would otherwise be told to set what it set.
         Err(editor::NoEditor::Unset) => {
-            app.status = "set `editor` in the plugin config, or $EDITOR".into();
+            app.status = "set `editor` in Diple config, or $EDITOR".into();
             return Ok(());
         }
         Err(editor::NoEditor::NamesNoProgram) => {
@@ -270,7 +268,7 @@ fn run_editor(
     cmd.args(&command.args).current_dir(&app.repo);
 
     if !command.wants_terminal {
-        // A window editor never reads the terminal, so reviewr keeps it. The reviewer keeps
+        // A window editor never reads the terminal, so Diple keeps it. The reviewer keeps
         // the diff on screen, and raw mode stays on, which is what keeps a `ctrl+c` in the
         // pane a key event rather than a signal that would take the comment store with it
         // Nothing waits on it either: the poll shows the write. The
@@ -289,12 +287,16 @@ fn run_editor(
 
     // A terminal editor paints in the pane, so it gets the pane and the loop waits it out.
     // Cooked mode comes back with it, so a `ctrl+c` pressed before the editor installs its own
-    // raw mode is a signal, not a key. That gap is the editor's own startup and reviewr adds
+    // raw mode is a signal, not a key. That gap is the editor's own startup and Diple adds
     // nothing to it.
+    if let Err(error) = attach_terminal_stdio(&mut cmd) {
+        app.status = format!("editor failed: {error}");
+        return Ok(());
+    }
     app.forget_pointer();
-    release_terminal(kbd);
+    release_terminal(terminal, kbd);
     let launched = cmd.status();
-    claim_terminal(kbd);
+    claim_terminal(terminal, kbd);
     drain_input(app)?;
 
     match launched {
@@ -306,13 +308,40 @@ fn run_editor(
             } else {
                 format!("editor exited with {status}")
             };
-            app.request_world_refresh(false, false);
+            app.request_world_refresh(false);
             app.refresh_commanded = true;
         }
         Err(e) => app.status = format!("editor failed: {e}"),
     }
     invalidate_screen(terminal)?;
     Ok(())
+}
+
+/// When stdout is Diple's result pipe, keep a terminal editor's UI on the controlling terminal
+/// too. Otherwise the child could leak terminal control bytes into the review payload.
+fn attach_terminal_stdio(cmd: &mut std::process::Command) -> io::Result<()> {
+    if io::stdout().is_terminal() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let terminal = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+        cmd.stdin(Stdio::from(terminal.try_clone()?))
+            .stdout(Stdio::from(terminal.try_clone()?))
+            .stderr(Stdio::from(terminal));
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let input = std::fs::OpenOptions::new().read(true).open("CONIN$")?;
+        let output = std::fs::OpenOptions::new().write(true).open("CONOUT$")?;
+        cmd.stdin(Stdio::from(input))
+            .stdout(Stdio::from(output.try_clone()?))
+            .stderr(Stdio::from(output));
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err(io::Error::new(io::ErrorKind::NotConnected, "no controlling terminal is available"))
 }
 
 /// Drop what ratatui believes is on screen, so the loop's next draw is a full one.
@@ -324,16 +353,14 @@ fn run_editor(
 /// `Terminal::resize` rather than `Terminal::clear`: `clear` first round-trips a cursor-position
 /// query through stdin and blocks until the terminal answers, which swallows the reviewer's next
 /// keypress. `resize` clears the same region and resets the same buffer with no query.
-fn invalidate_screen(terminal: &mut DefaultTerminal) -> Result<()> {
+fn invalidate_screen(terminal: &mut DipleTerminal) -> Result<()> {
     let area = terminal.size()?.into();
     terminal.resize(area)?;
     Ok(())
 }
 
 /// The reviewed repository, resolved to its git top level. Every `App` goes through this,
-/// blocked or ready, so the app and the worker's `TurnHost` hold the same spelling: they key
-/// the baseline ref off it independently, and turn membership compares resolved top levels
-/// against it.
+/// blocked or ready, so synchronous and worker reads use the same spelling.
 ///
 /// A non-repo path is not an error — the pane opens to an empty state and starts showing
 /// changes if the directory becomes a repo.
@@ -344,9 +371,9 @@ fn repo_root(cfg: &Config) -> std::path::PathBuf {
 /// The startup app for one config snapshot: ready on `Ok`, blocked with the error on
 /// `Err`. Both the env-resolved build and the post-paint CLI-resolved rebuild go through
 /// here, so the two paths cannot drift.
-fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginConfigError>) -> App {
+fn app_for(cfg: &Config, initial_config: &Result<AppConfig, config::AppConfigError>) -> App {
     match initial_config {
-        Ok(plugin_config) => ready_app(cfg, plugin_config.clone()),
+        Ok(app_config) => ready_app(cfg, app_config.clone()),
         Err(error) => {
             let mut app = App::blocked(repo_root(cfg), Scope::Uncommitted, cfg.base.clone());
             app.set_config_error(error.to_string());
@@ -355,10 +382,10 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
     }
 }
 
-/// Build a fresh working reviewr pane only after the plugin configuration has validated.
-fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
+/// Build a fresh working Diple pane only after its configuration has validated.
+fn ready_app(cfg: &Config, app_config: AppConfig) -> App {
     let repo = repo_root(cfg);
-    let scope = plugin_config.default_scope();
+    let scope = app_config.default_scope();
     logln!(
         "start repo={} poll={:?} base={:?} scope={}",
         repo.display(),
@@ -367,7 +394,7 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
         scope.name()
     );
     let mut app = App::new(repo, scope, cfg.base.clone());
-    app.set_plugin_config(plugin_config);
+    app.set_app_config(app_config);
     app.set_cli_theme(cfg.theme.clone());
     if let Some(wrap) = cfg.wrap {
         app.wrap = wrap;
@@ -379,7 +406,7 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
 const STATUS_TTL: Duration = Duration::from_secs(4);
 
 /// The exit deadline: stillness this long after the pointer's last event sat on the pane's
-/// edge completes the live gesture — herdr routes mouse by pointer position, so a release
+/// edge completes the live gesture — Diple routes mouse by pointer position, so a release
 /// past the pane never arrives. Long enough that a pause while border-scrolling survives,
 /// short enough that an overshoot release's copy beats the paste.
 /// Its own constant, never the `--poll` cadence: the two measure unrelated things.
@@ -387,7 +414,7 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(1);
 
 /// While the `PR` tab is active, refetch the forge at least this often — a fallback for
 /// forge-side changes with no local signal (a reviewer's comment). Local pushes and forge PR
-/// actions refresh sooner, on the worktree's turn-end, so this cadence is the slow safety net
+/// actions refresh sooner through repository probes, so this cadence is the slow safety net.
 const PR_POLL: Duration = Duration::from_mins(1);
 
 /// How long an in-flight PR fetch may run before a refresh trigger stops waiting on it.
@@ -460,7 +487,7 @@ struct ActiveFetch {
 /// values still match, so a late observation can never reinterpret painted keys or geometry.
 #[derive(Debug)]
 struct PaintedFrameSnapshot {
-    plugin_config: Option<PluginConfig>,
+    app_config: Option<AppConfig>,
     config_error: Option<String>,
     navigator_position: crate::config::NavigatorPosition,
     navigator_side_pct: u16,
@@ -470,7 +497,7 @@ struct PaintedFrameSnapshot {
 impl PaintedFrameSnapshot {
     fn capture(app: &App) -> Self {
         Self {
-            plugin_config: app.plugin_config().cloned(),
+            app_config: app.app_config().cloned(),
             config_error: app.config_error().map(str::to_owned),
             navigator_position: app.navigator_position,
             navigator_side_pct: app.navigator_side_pct,
@@ -479,7 +506,7 @@ impl PaintedFrameSnapshot {
     }
 
     fn still_current(&self, app: &App) -> bool {
-        self.plugin_config.as_ref() == app.plugin_config()
+        self.app_config.as_ref() == app.app_config()
             && self.config_error.as_deref() == app.config_error()
             && self.navigator_position == app.navigator_position
             && self.navigator_side_pct == app.navigator_side_pct
@@ -488,11 +515,11 @@ impl PaintedFrameSnapshot {
 
     /// This frame's `editor` command, so one press uses one validated snapshot
     fn editor(&self) -> Option<&str> {
-        self.plugin_config.as_ref().and_then(PluginConfig::editor)
+        self.app_config.as_ref().and_then(AppConfig::editor)
     }
 
     fn keymap(&self) -> &Keymap {
-        match &self.plugin_config {
+        match &self.app_config {
             Some(config) => config.keymap(),
             None => keymap::default_keymap(),
         }
@@ -526,8 +553,8 @@ impl PrCoordinator {
     }
 
     /// Start a refresh, or ride the one already underway. A commanded refresh cancels the
-    /// in-flight fetch and starts fresh. The ambient triggers — tab entry, a turn end, the
-    /// fallback timer — join a fetch in flight or a completion awaiting its probe, and arm
+    /// in-flight fetch and starts fresh. The ambient triggers — tab entry and the fallback
+    /// timer — join a fetch in flight or a completion awaiting its probe, and arm
     /// one trailing fetch behind it: the ridden result still paints (nothing waits on a
     /// repeated fetch), and the trailing fetch supersedes it with a read the trigger is
     /// guaranteed to predate — a remote-only change is never lost to the fallback timer
@@ -775,9 +802,8 @@ impl PrRefresh {
     }
 }
 
-/// Land one world completion. The worker's baseline syncs and a turn end schedules the PR
-/// refetch regardless of the tag; the snapshot reconciles only when the completion carries
-/// the live generation and its input still matches the view — a mismatched snapshot is
+/// Land one world completion. The snapshot reconciles only when the completion carries the
+/// live generation and its input still matches the view — a mismatched snapshot is
 /// discarded whole and a fresh refresh queued. Returns whether the
 /// completion matched the live generation — the caller clears the in-flight marker on
 /// `true`.
@@ -786,20 +812,11 @@ pub fn land_world_completion(
     completion: crate::world::WorldCompletion,
     generation: u64,
 ) -> bool {
-    app.sync_turn_baseline(completion.input.turn_baseline.clone());
-    if let Some(turn) = completion.turn.as_ref() {
-        app.sync_agents_present(turn.agents_present);
-        if turn.ended {
-            // One fetch per turn, on any tab: the turn may have pushed or merged, and
-            // entering the tab then finds fresh work already underway.
-            app.request_pr_refresh(crate::app::RefreshKind::Ambient);
-        }
-    }
     if completion.generation != generation {
         // A superseding job carries reveal=false, so a superseded switch's reveal would
         // die here; re-arm it to ride the next dispatch instead.
         if completion.reveal {
-            app.request_world_refresh(false, true);
+            app.request_world_refresh(true);
         }
         return false;
     }
@@ -817,7 +834,7 @@ pub fn land_world_completion(
         }
         // The view moved on while the build ran: discard whole, refresh again, keeping
         // an undelivered reveal alive.
-        Some(Ok(_)) => app.request_world_refresh(false, completion.reveal),
+        Some(Ok(_)) => app.request_world_refresh(completion.reveal),
         // A failed refresh reports and keeps the stale frame — the same contract as a
         // failed poll.
         Some(Err(e)) => app.status = format!("refresh failed: {e}"),
@@ -842,7 +859,7 @@ pub fn land_search_completion(
 }
 
 /// Whether a file tab's in-flight refresh shows the tab-strip glyph: past the delay, and
-/// only for a job that builds a snapshot — a sample-only job never lights it.
+/// only for a job that builds a snapshot — a PR-tab no-op job never lights it.
 fn world_indicator(inflight: Option<(Duration, bool)>) -> bool {
     inflight.is_some_and(|(elapsed, builds)| builds && elapsed >= INDICATOR_DELAY)
 }
@@ -858,18 +875,13 @@ fn glyph_clears(lit_for: Duration) -> bool {
 const WORKER_TIGHT_WAKE: Duration = Duration::from_millis(15);
 
 /// The wake while a world job is in flight: tight for a building job so its landing paints
-/// near the build's own speed, the fetch cadence for a sample-only one.
+/// near the build's own speed, the fetch cadence for a PR-tab no-op.
 fn world_wake(builds: bool) -> Duration {
     if builds { WORKER_TIGHT_WAKE } else { Duration::from_millis(100) }
 }
 
 /// Draw, then wait up to the poll deadline for input; refresh on each tick.
-fn event_loop(
-    terminal: &mut DefaultTerminal,
-    app: &mut App,
-    cfg: &Config,
-    kbd: bool,
-) -> Result<()> {
+fn event_loop(terminal: &mut DipleTerminal, app: &mut App, cfg: &Config, kbd: bool) -> Result<()> {
     let poll = cfg.poll;
     let mut last_poll = Instant::now();
     // The exit signature's two halves: the last mouse event's arrival, and whether that
@@ -882,20 +894,16 @@ fn event_loop(
     // a fresh probe proves its complete input still matches.
     let (probe_tx, probe_rx) =
         mpsc::channel::<(u64, Result<crate::forge::PrFetchInput, crate::forge::PrInputError>)>();
-    let (recovery_tx, recovery_rx) = mpsc::channel::<(u64, PluginConfig, App)>();
+    let (recovery_tx, recovery_rx) = mpsc::channel::<(u64, AppConfig, App)>();
     let mut recovery_inflight = false;
     let (pr_tx, pr_rx) = mpsc::channel::<TaggedPr>();
-    let mut pr = PrCoordinator::new(app.plugin_config().is_some());
-    // The world worker owns every refresh build and the turn tracker; the loop sends
-    // input-tagged jobs and reconciles the completions.
+    let mut pr = PrCoordinator::new(app.app_config().is_some());
+    // The world worker owns every refresh build; the loop sends input-tagged jobs and
+    // reconciles the completions.
     let (world_tx, world_job_rx) = mpsc::channel::<crate::world::WorldJob>();
     let (world_res_tx, world_rx) = mpsc::channel::<crate::world::WorldCompletion>();
-    let _world_worker = crate::world::spawn(
-        crate::world::TurnHost::open(app.repo.clone()),
-        world_job_rx,
-        world_res_tx,
-    );
-    // Window editors reviewr launched, reaped at the next press.
+    let _world_worker = crate::world::spawn(world_job_rx, world_res_tx);
+    // Window editors Diple launched, reaped at the next press.
     let mut open_editors: Vec<std::process::Child> = Vec::new();
     let mut world_generation = 0_u64;
     let mut world_inflight: Option<(Instant, bool)> = None;
@@ -920,7 +928,7 @@ fn event_loop(
             if let Ok((epoch, target, mut recovered)) = recovery_rx.try_recv() {
                 recovery_inflight = false;
                 if epoch == config_epoch {
-                    match config::plugin_config(cfg.plugin_config_dir.as_deref()) {
+                    match config::app_config(cfg.config_dir.as_deref()) {
                         Ok(current) if current == target => {
                             recovered.carry_authored_state_from(app);
                             *app = recovered;
@@ -943,7 +951,7 @@ fn event_loop(
             let area = Rect::new(0, 0, size.width, size.height);
             // Every frame starts from one complete validated config snapshot. Input below uses the
             // keymap and geometry this draw paints; later observations continue before another input.
-            reconcile_plugin_config(
+            reconcile_app_config(
                 app,
                 cfg,
                 area,
@@ -1112,10 +1120,9 @@ fn event_loop(
                 let job = crate::world::WorldJob {
                     generation: world_generation,
                     input: app.world_input(),
-                    sample_turn: request.sample_turn,
                     reveal: request.reveal,
                 };
-                // A sample-only job (the `PR` tab's poll) builds no snapshot: it neither
+                // A `PR` tab poll builds no snapshot: it neither
                 // lights the file tabs' glyph nor deserves the tight landing wake.
                 let builds = job.input.tab.is_file_tab();
                 world_inflight = if world_tx.send(job).is_ok() {
@@ -1152,7 +1159,7 @@ fn event_loop(
                     continue;
                 }
                 pr.active_fetch = None;
-                let config_gate = reconcile_plugin_config(
+                let config_gate = reconcile_app_config(
                     app,
                     cfg,
                     area,
@@ -1179,7 +1186,7 @@ fn event_loop(
                     continue;
                 }
                 pr.active_probe_epoch = None;
-                let config_gate = reconcile_plugin_config(
+                let config_gate = reconcile_app_config(
                     app,
                     cfg,
                     area,
@@ -1201,22 +1208,22 @@ fn event_loop(
                 }
             }
 
-            if pr.can_start_probe(app.plugin_config().is_some()) {
+            if pr.can_start_probe(app.app_config().is_some()) {
                 pr.probe_pending = false;
-                let (tx, repo, base, plugin_config, epoch) = (
+                let (tx, repo, base, app_config, epoch) = (
                     probe_tx.clone(),
                     app.repo.clone(),
                     app.base.clone(),
-                    app.plugin_config().expect("config checked above").clone(),
+                    app.app_config().expect("config checked above").clone(),
                     config_epoch,
                 );
                 let verifies_completion = pr.refresh.pending.is_some();
                 pr.active_probe_epoch = Some(epoch);
                 thread::spawn(move || {
                     let input = if verifies_completion {
-                        crate::forge::verify_input(&repo, base.as_deref(), &plugin_config)
+                        crate::forge::verify_input(&repo, base.as_deref(), &app_config)
                     } else {
-                        crate::forge::fetch_input(&repo, base.as_deref(), &plugin_config)
+                        crate::forge::fetch_input(&repo, base.as_deref(), &app_config)
                     };
                     let _ = tx.send((epoch, input));
                 });
@@ -1368,7 +1375,7 @@ fn event_loop(
                 complete_gesture(app, area, &Clipboard);
             }
             if last_poll.elapsed() >= poll {
-                let config_gate = reconcile_plugin_config(
+                let config_gate = reconcile_app_config(
                     app,
                     cfg,
                     area,
@@ -1382,11 +1389,9 @@ fn event_loop(
                     continue;
                 }
                 schedule_poll_probe(&mut pr, app.tab);
-                // The tick's refresh runs on the worker. The same request samples the agents
-                // in the worktree there, so a turn promoted by the sample is visible to the
-                // same request's changed-files build. A turn end sets
-                // the PR refetch when the completion lands.
-                app.request_world_refresh(true, false);
+                // The tick's file refresh runs on the worker. The repository probe above also
+                // detects local identity changes that should refresh the PR snapshot.
+                app.request_world_refresh(false);
                 logln!(
                     "poll files={} composing={} diff_cursor={} scroll={}",
                     app.entries.len(),
@@ -1399,7 +1404,7 @@ fn event_loop(
         }
         Ok(())
     })();
-    restore_terminal(kbd);
+    restore_terminal(terminal, kbd);
     drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
     result
 }
@@ -1491,17 +1496,17 @@ fn apply_pr_probe_result(
     }
 }
 
-fn reconcile_plugin_config(
+fn reconcile_app_config(
     app: &mut App,
     cfg: &Config,
     area: Rect,
     config_epoch: &mut u64,
-    recovery_tx: &mpsc::Sender<(u64, PluginConfig, App)>,
+    recovery_tx: &mpsc::Sender<(u64, AppConfig, App)>,
     recovery_inflight: &mut bool,
     pr: &mut PrCoordinator,
 ) -> ConfigGate {
-    let previous = app.plugin_config().cloned();
-    let observed = config::plugin_config(cfg.plugin_config_dir.as_deref());
+    let previous = app.app_config().cloned();
+    let observed = config::app_config(cfg.config_dir.as_deref());
     // A config layout or theme change reflows the frame under a live gesture, and the block
     // screen replaces its body: both complete the gesture's copy before the new frame
     // applies, so a world event never silently ends a visible selection.
@@ -1511,7 +1516,7 @@ fn reconcile_plugin_config(
     {
         complete_gesture(app, area, &Clipboard);
     }
-    if !apply_plugin_config_observation(
+    if !apply_app_config_observation(
         app,
         cfg,
         config_epoch,
@@ -1522,7 +1527,7 @@ fn reconcile_plugin_config(
         pr.stop();
         return ConfigGate::Blocked;
     }
-    let current = app.plugin_config().expect("ready after successful observation");
+    let current = app.app_config().expect("ready after successful observation");
     let Some(previous) = previous.filter(|previous| previous != current) else {
         return ConfigGate::Unchanged;
     };
@@ -1545,7 +1550,7 @@ fn reconcile_plugin_config(
 /// layout or theme change reflows the frame, and a failed observation (`None`) blocks the
 /// body.
 #[must_use]
-fn config_ends_gesture(previous: &PluginConfig, observed: Option<&PluginConfig>) -> bool {
+fn config_ends_gesture(previous: &AppConfig, observed: Option<&AppConfig>) -> bool {
     match observed {
         Some(c) => {
             previous.navigator_position() != c.navigator_position() || previous.theme() != c.theme()
@@ -1557,18 +1562,18 @@ fn config_ends_gesture(previous: &PluginConfig, observed: Option<&PluginConfig>)
 /// Apply one complete config observation. Invalid state blocks work. Recovery loads a fresh
 /// app on a tagged worker, then the event loop revalidates its target and carries authored
 /// review state before swapping it in.
-fn apply_plugin_config_observation(
+fn apply_app_config_observation(
     app: &mut App,
     cfg: &Config,
     epoch: &mut u64,
-    recovery_tx: &mpsc::Sender<(u64, PluginConfig, App)>,
+    recovery_tx: &mpsc::Sender<(u64, AppConfig, App)>,
     recovery_inflight: &mut bool,
-    observed: Result<PluginConfig, config::PluginConfigError>,
+    observed: Result<AppConfig, config::AppConfigError>,
 ) -> bool {
     match observed {
         Ok(next) => {
-            let recovering = app.plugin_config().is_none();
-            let changed = app.plugin_config().is_some_and(|current| current != &next);
+            let recovering = app.app_config().is_none();
+            let changed = app.app_config().is_some_and(|current| current != &next);
             if recovering {
                 if !*recovery_inflight {
                     *epoch = epoch.wrapping_add(1);
@@ -1585,17 +1590,17 @@ fn apply_plugin_config_observation(
                 }
                 return false;
             } else if changed {
-                let current = app.plugin_config().expect("ready config");
+                let current = app.app_config().expect("ready config");
                 if current.forge_hosts() != next.forge_hosts() {
                     *epoch = epoch.wrapping_add(1);
                 }
-                app.set_plugin_config(next);
+                app.set_app_config(next);
             }
             true
         }
         Err(error) => {
             let message = error.to_string();
-            if app.plugin_config().is_some() || app.config_error() != Some(message.as_str()) {
+            if app.app_config().is_some() || app.config_error() != Some(message.as_str()) {
                 *epoch = epoch.wrapping_add(1);
             }
             app.set_config_error(message);
@@ -1737,29 +1742,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         app.disarm_cross();
     }
 
-    // The agent picker is strictly modal: `enter` sends, `esc` cancels, the movement bindings
-    // and the literal digits move the highlight, and every other key is inert. `q` must not
-    // quit here and `y` must not copy, or a habitual keystroke destroys or consumes the whole
-    // review while the picker is up. It is checked before the tab handlers,
-    // like every other modal, so no tab can ever eat the modal's keys.
-    if app.mode == Mode::Picker {
-        // The send is irreversible and consumes every comment, so only the bare key fires it:
-        // `alt+enter` and `shift+enter` mean "newline, not submit" in the comment editor the
-        // reviewer was in moments ago, and that muscle memory must not send a review. The digits
-        // are literal here, whatever `tab-changes` and its siblings are bound to, so a chord
-        // carrying one must not move the highlight either. `esc` stays deliberately permissive:
-        // cancelling is always safe, and no stray modifier should trap anyone in the modal.
-        let bare = key.modifiers.is_empty();
-        match (action, key.code) {
-            (_, Esc) => app.close_picker(),
-            (_, Enter) if bare => app.picker_pick(),
-            // The digits outrank the movement bindings, so a reviewer who bound `down` to a
-            // digit still gets the row that digit names.
-            (_, Char(c @ '1'..='9')) if bare => {
-                app.picker_goto(c as usize - '1' as usize);
-            }
-            (Some(K::Down), _) => app.picker_move(1),
-            (Some(K::Up), _) => app.picker_move(-1),
+    if app.mode == Mode::ConfirmSend {
+        match key.code {
+            Esc => app.cancel_send(),
+            Enter if key.modifiers.is_empty() => app.confirm_send(),
             _ => {}
         }
         return Ok(());
@@ -1840,7 +1826,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             (Some(K::Comments), _) | (_, Esc) => app.close_list(),
             (Some(K::Down), _) => app.list_move(1),
             (Some(K::Up), _) => app.list_move(-1),
-            (Some(K::Send), _) => app.send_to_agent(),
+            (Some(K::Send), _) => app.begin_send(),
             (Some(K::Copy), _) => {
                 app.export(&Clipboard);
             }
@@ -1855,7 +1841,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         match action {
             K::Quit => app.should_quit = true,
             K::Refresh => {
-                app.request_world_refresh(false, false);
+                app.request_world_refresh(false);
                 app.refresh_commanded = true;
             }
             K::TabChanges => app.set_tab(crate::app::Tab::Changes)?,
@@ -1883,6 +1869,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::PrevHunk => app.prev_hunk(),
             K::NextFile => app.next_file(),
             K::PrevFile => app.prev_file(),
+            K::ToggleStage => app.toggle_stage()?,
             K::Wrap => app.toggle_wrap(),
             K::Preview => app.toggle_preview(),
             K::NavigatorPosition => app.cycle_navigator_position(),
@@ -1891,7 +1878,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::NavigatorShrink => app.resize_navigator(-4),
             K::ScopeUncommitted => app.set_scope(Scope::Uncommitted)?,
             K::ScopeBranch => app.set_scope(Scope::Branch)?,
-            K::ScopeLastTurn => app.set_scope(Scope::LastTurn)?,
             K::ScopeCommits => app.set_scope(Scope::Commits)?,
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
@@ -1904,7 +1890,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             // selected file.
             K::Edit => app.start_edit(),
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
-            K::Send => app.send_to_agent(),
+            K::Send => app.begin_send(),
             K::Copy => {
                 app.export(&Clipboard);
             }
@@ -1995,8 +1981,8 @@ fn edge_delta(row: u16, inner: Rect) -> isize {
     isize::from(row >= inner.y + inner.height)
 }
 
-/// Whether the pointer's cell sits on reviewr's own pane edge — the position half of the
-/// exit signature. herdr delivers mouse events from anywhere
+/// Whether the pointer's cell sits on Diple's own pane edge — the position half of the
+/// exit signature. Diple delivers mouse events from anywhere
 /// inside the pane, so a release anywhere further in would have arrived; only the outermost
 /// cells can precede a lost release. Public for the gesture tests, like [`handle_mouse`].
 #[must_use]
@@ -2355,7 +2341,7 @@ pub fn handle_mouse(
 ) -> Result<()> {
     app.hover = Some((m.column, m.row));
     // Pointer motion with no button held, or a fresh mouse-down, proves an active gesture's
-    // release was lost — herdr routes mouse by pointer position, so a release over another
+    // release was lost — Diple routes mouse by pointer position, so a release over another
     // pane never arrives here. The proof completes the old gesture (a visible selection
     // copies, `TS-NO-SILENT-LOSS`), then the event acts as any event. A motionless held drag
     // feeds no events at all and stays alive. One guard for every dispatch path below
@@ -2438,16 +2424,6 @@ pub fn handle_mouse(
             }
         }
         match m.kind {
-            // A click moves the highlight; a click on the already-highlighted row sends. The
-            // highlight is armed when the picker opens, so a first click on the armed row
-            // sends straight away. Every other gesture is inert.
-            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::Picker => {
-                match ui::hit_picker_row(area, app, m.column, m.row) {
-                    Some(i) if i == app.picker_cursor => app.picker_pick(),
-                    Some(i) => app.picker_goto(i),
-                    None => {}
-                }
-            }
             // Same shape in the base picker: click to highlight, click the highlight to pick
             MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::BasePick => {
                 match ui::hit_base_picker_row(area, app, m.column, m.row) {
@@ -2481,7 +2457,7 @@ pub fn handle_mouse(
     // A mouse gesture is one of the "any other input" that drops an armed crossing: the reviewer
     // who reaches for the mouse has left the file's edge behind. Pointer motion
     // is not a gesture — capture reports every move over the pane, and a pointer resting on
-    // the reviewr pane would otherwise disarm the crossing without the reviewer touching
+    // the Diple pane would otherwise disarm the crossing without the reviewer touching
     // anything.
     if !matches!(m.kind, MouseEventKind::Moved) {
         app.disarm_cross();
@@ -2659,7 +2635,7 @@ mod refresh_tests {
 
     use super::{
         ActiveFetch, FETCH_HANG, PaintedFrameSnapshot, PrCoordinator, PrEffect, PrRefresh,
-        TaggedPr, apply_plugin_config_observation, apply_pr_probe_result, drain_pr_shutdown,
+        TaggedPr, apply_app_config_observation, apply_pr_probe_result, drain_pr_shutdown,
         glyph_clears, handle_blocked_event, handle_resize, ready_app, schedule_poll_probe,
         world_indicator, world_wake,
     };
@@ -2693,7 +2669,7 @@ mod refresh_tests {
         assert_eq!(world_wake(true), Duration::from_millis(15));
         assert_eq!(world_wake(false), Duration::from_millis(100));
     }
-    use crate::config::{Config, plugin_config_in};
+    use crate::config::{Config, app_config_in};
     use crate::forge::{PrFetchInput, PrView};
     use crate::git::RepositoryIdentity;
     use crate::model::Scope;
@@ -2875,31 +2851,31 @@ mod refresh_tests {
         std::fs::write(&path, "navigator_position = \"right\"\n").unwrap();
         let cfg = Config::parse([repo.path().display().to_string()]);
         let mut app = App::new(repo.path().to_path_buf(), Scope::Uncommitted, None);
-        app.set_plugin_config(plugin_config_in(config_dir.path()).unwrap());
+        app.set_app_config(app_config_in(config_dir.path()).unwrap());
         let painted = PaintedFrameSnapshot::capture(&app);
         let (tx, _rx) = mpsc::channel();
         let mut epoch = 0;
         let mut recovery_inflight = false;
 
         std::fs::write(&path, "navigator_position = \"bottom\"\n").unwrap();
-        assert!(apply_plugin_config_observation(
+        assert!(apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
         assert!(!painted.still_current(&app), "input must wait for the bottom layout to paint");
 
         let repainted = PaintedFrameSnapshot::capture(&app);
-        assert!(apply_plugin_config_observation(
+        assert!(apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
         assert!(repainted.still_current(&app), "an unchanged observation keeps the frame valid");
     }
@@ -3383,41 +3359,45 @@ mod refresh_tests {
     }
 
     #[test]
-    fn shell_only_config_changes_do_not_invalidate_runtime_work() {
+    fn forge_config_changes_advance_the_fetch_epoch() {
         let repo = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        std::fs::write(config_dir.path().join("config.toml"), "auto_open = false\n").unwrap();
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            "github_host = \"github.example.com\"\n",
+        )
+        .unwrap();
         let cfg = Config::parse([repo.path().display().to_string()]);
         let mut app = App::new(repo.path().to_path_buf(), Scope::Uncommitted, None);
         let (tx, _rx) = mpsc::channel();
         let mut epoch = 0;
         let mut recovery_inflight = false;
 
-        assert!(apply_plugin_config_observation(
+        assert!(apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
-        assert_eq!(epoch, 0);
-        assert!(!app.plugin_config().unwrap().auto_open());
+        assert_eq!(epoch, 1);
+        assert_eq!(app.app_config().unwrap().github_host(), Some("github.example.com"));
 
         std::fs::write(
             config_dir.path().join("config.toml"),
-            "github_host = \"github.example.com\"\n",
+            "gitlab_host = \"gitlab.example.com\"\n",
         )
         .unwrap();
-        assert!(apply_plugin_config_observation(
+        assert!(apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
-        assert_eq!(epoch, 1);
+        assert_eq!(epoch, 2);
     }
 
     #[test]
@@ -3427,48 +3407,48 @@ mod refresh_tests {
         let path = config_dir.path().join("config.toml");
         std::fs::write(&path, "default_scope = \"branch\"\n").unwrap();
         let cfg = Config::parse([repo.path().display().to_string()]);
-        let mut app = ready_app(&cfg, plugin_config_in(config_dir.path()).unwrap());
+        let mut app = ready_app(&cfg, app_config_in(config_dir.path()).unwrap());
         assert_eq!(app.scope, Scope::Branch, "startup seeds the configured scope");
 
         // The user switches in-session; a reread with a different default must not move it.
-        app.set_scope(Scope::LastTurn).unwrap();
+        app.set_scope(Scope::Uncommitted).unwrap();
         std::fs::write(&path, "default_scope = \"uncommitted\"\n").unwrap();
         let (tx, _rx) = mpsc::channel();
         let mut epoch = 0;
         let mut recovery_inflight = false;
-        assert!(apply_plugin_config_observation(
+        assert!(apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
-        assert_eq!(app.scope, Scope::LastTurn, "a reread never switches the active scope");
+        assert_eq!(app.scope, Scope::Uncommitted, "a reread never switches the active scope");
         assert_eq!(epoch, 0, "a default_scope change invalidates no running work");
     }
 
     #[test]
     fn only_a_layout_or_theme_change_or_a_block_ends_a_gesture() {
-        use crate::config::plugin_config_in;
+        use crate::config::app_config_in;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "theme = \"gruvbox\"\n").unwrap();
-        let previous = plugin_config_in(dir.path()).unwrap();
+        let previous = app_config_in(dir.path()).unwrap();
 
         // The same config, and a change that reflows nothing, leave the gesture alone.
         assert!(!super::config_ends_gesture(&previous, Some(&previous)));
         std::fs::write(&path, "theme = \"gruvbox\"\ndefault_scope = \"branch\"\n").unwrap();
-        let scoped = plugin_config_in(dir.path()).unwrap();
+        let scoped = app_config_in(dir.path()).unwrap();
         assert!(!super::config_ends_gesture(&previous, Some(&scoped)));
 
         // A theme or layout change reflows the frame, and a failed observation blocks the
         // body: each ends the gesture with its copy.
         std::fs::write(&path, "theme = \"nord\"\n").unwrap();
-        let themed = plugin_config_in(dir.path()).unwrap();
+        let themed = app_config_in(dir.path()).unwrap();
         assert!(super::config_ends_gesture(&previous, Some(&themed)));
         std::fs::write(&path, "theme = \"gruvbox\"\nnavigator_position = \"left\"\n").unwrap();
-        let moved = plugin_config_in(dir.path()).unwrap();
+        let moved = app_config_in(dir.path()).unwrap();
         assert!(super::config_ends_gesture(&previous, Some(&moved)));
         assert!(super::config_ends_gesture(&previous, None));
     }
@@ -3481,9 +3461,9 @@ mod refresh_tests {
         let path = config_dir.path().join("config.toml");
         std::fs::write(&path, "theme = \"gruvbox\"\n").unwrap();
         let mut cfg = Config::parse([repo.path().display().to_string()]);
-        cfg.plugin_config_dir = Some(config_dir.path().to_path_buf());
+        cfg.config_dir = Some(config_dir.path().to_path_buf());
         let mut app = App::new(repo.path().to_path_buf(), Scope::Uncommitted, None);
-        app.set_plugin_config(crate::config::plugin_config_in(config_dir.path()).unwrap());
+        app.set_app_config(crate::config::app_config_in(config_dir.path()).unwrap());
         let (tx, _rx) = mpsc::channel();
         let mut epoch = 0;
         let mut recovery_inflight = false;
@@ -3501,7 +3481,7 @@ mod refresh_tests {
 
         // An unchanged observation leaves the gesture alone.
         app.gesture = press;
-        super::reconcile_plugin_config(
+        super::reconcile_app_config(
             &mut app,
             &cfg,
             area,
@@ -3515,7 +3495,7 @@ mod refresh_tests {
         // The end table's config row: a theme change ends the gesture at the boundary,
         // before the new frame applies.
         std::fs::write(&path, "theme = \"nord\"\n").unwrap();
-        super::reconcile_plugin_config(
+        super::reconcile_app_config(
             &mut app,
             &cfg,
             area,
@@ -3525,7 +3505,7 @@ mod refresh_tests {
             &mut pr,
         );
         assert!(!app.gesture_active(), "the theme change completes the gesture");
-        assert_eq!(app.plugin_config().unwrap().theme(), "nord");
+        assert_eq!(app.app_config().unwrap().theme(), "nord");
     }
 
     #[test]
@@ -3540,30 +3520,30 @@ mod refresh_tests {
         let mut epoch = 0;
         let mut recovery_inflight = false;
 
-        assert!(!apply_plugin_config_observation(
+        assert!(!apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
-        assert!(app.plugin_config().is_none());
+        assert!(app.app_config().is_none());
         assert!(app.config_error().unwrap().contains("unknown key"));
 
         std::fs::write(&path, "theme = \"gruvbox\"\n").unwrap();
-        assert!(!apply_plugin_config_observation(
+        assert!(!apply_app_config_observation(
             &mut app,
             &cfg,
             &mut epoch,
             &tx,
             &mut recovery_inflight,
-            plugin_config_in(config_dir.path()),
+            app_config_in(config_dir.path()),
         ));
         let (recovery_epoch, target, recovered) =
             rx.recv_timeout(Duration::from_secs(5)).expect("recovery worker");
         assert_eq!(recovery_epoch, epoch);
         assert_eq!(target.theme(), "gruvbox");
-        assert_eq!(recovered.plugin_config().unwrap().theme(), "gruvbox");
+        assert_eq!(recovered.app_config().unwrap().theme(), "gruvbox");
     }
 }

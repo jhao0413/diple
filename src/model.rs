@@ -8,7 +8,6 @@
 pub enum Scope {
     Uncommitted,
     Branch,
-    LastTurn,
     /// A picked run of commits, diffed `A^` against `B`.
     Commits,
 }
@@ -18,7 +17,6 @@ impl Scope {
         match self {
             Scope::Uncommitted => "uncommitted",
             Scope::Branch => "branch",
-            Scope::LastTurn => "last turn",
             Scope::Commits => "commits",
         }
     }
@@ -29,19 +27,16 @@ impl Scope {
         match self {
             Scope::Uncommitted => "uncommitted",
             Scope::Branch => "branch",
-            Scope::LastTurn => "last-turn",
             Scope::Commits => "commits",
         }
     }
 
-    /// Cycle to the next scope, for the header chip click: uncommitted → branch → last turn →
-    /// commits.
+    /// Cycle to the next scope, for the header chip click.
     #[must_use]
     pub fn cycle(self) -> Self {
         match self {
             Scope::Uncommitted => Scope::Branch,
-            Scope::Branch => Scope::LastTurn,
-            Scope::LastTurn => Scope::Commits,
+            Scope::Branch => Scope::Commits,
             Scope::Commits => Scope::Uncommitted,
         }
     }
@@ -96,6 +91,42 @@ impl ChangeKind {
     }
 }
 
+/// The two-column status of a path in the uncommitted scope. `staged` is git's index
+/// column and `unstaged` is its worktree column. Untracked files carry `??`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StatusCode {
+    pub staged: Option<char>,
+    pub unstaged: Option<char>,
+}
+
+impl StatusCode {
+    /// Human-facing markers that make the index/worktree split explicit.
+    pub fn display_chars(self) -> (char, char) {
+        let staged = match self.staged {
+            Some('?') => '?',
+            Some(_) => 'S',
+            None => '.',
+        };
+        let unstaged = match self.unstaged {
+            Some('?') => '?',
+            Some(_) => 'U',
+            None => '.',
+        };
+        (staged, unstaged)
+    }
+
+    pub fn is_staged(self) -> bool {
+        matches!(self.staged, Some(c) if c != '?')
+    }
+}
+
+/// Per-side line counts for an uncommitted path: `HEAD` to index, then index to worktree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StageStats {
+    pub staged: (u32, u32),
+    pub unstaged: (u32, u32),
+}
+
 /// A row in the Changes list.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ChangedFile {
@@ -106,6 +137,10 @@ pub struct ChangedFile {
     /// The old path of a renamed file; `None` for every other kind. Its old content lives
     /// at this path, so a rename diffs real content instead of reading as all-insertion.
     pub previous_path: Option<String>,
+    /// Present only for the uncommitted scope.
+    pub status_code: Option<StatusCode>,
+    /// Present only for the uncommitted scope.
+    pub stage_stats: Option<StageStats>,
 }
 
 /// Which side of the diff a comment's lines live on.
@@ -220,15 +255,29 @@ mod tests {
 
     #[test]
     fn scope_cycles_and_labels() {
-        // The chip click cycles through all four scopes and wraps.
+        // The chip click cycles through all three scopes and wraps.
         assert_eq!(Scope::Uncommitted.cycle(), Scope::Branch);
-        assert_eq!(Scope::Branch.cycle(), Scope::LastTurn);
-        assert_eq!(Scope::LastTurn.cycle(), Scope::Commits);
+        assert_eq!(Scope::Branch.cycle(), Scope::Commits);
         assert_eq!(Scope::Commits.cycle(), Scope::Uncommitted);
         assert_eq!(Scope::Uncommitted.label(), "uncommitted");
-        assert_eq!(Scope::LastTurn.label(), "last turn");
         assert_eq!(Scope::Commits.label(), "commits");
         assert_eq!(Scope::Commits.name(), "commits");
+    }
+
+    #[test]
+    fn status_display_makes_index_and_worktree_explicit() {
+        assert_eq!(
+            super::StatusCode { staged: Some('M'), unstaged: None }.display_chars(),
+            ('S', '.')
+        );
+        assert_eq!(
+            super::StatusCode { staged: None, unstaged: Some('D') }.display_chars(),
+            ('.', 'U')
+        );
+        assert_eq!(
+            super::StatusCode { staged: Some('?'), unstaged: Some('?') }.display_chars(),
+            ('?', '?')
+        );
     }
 
     #[test]

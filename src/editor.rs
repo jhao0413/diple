@@ -24,7 +24,7 @@ enum LineArg {
 
 /// One editor family: the binary names that select it, how it takes a line, and where it draws.
 ///
-/// A window editor hands the file to an instance of its own and returns, so reviewr keeps the
+/// A window editor hands the file to an instance of its own and returns, so Diple keeps the
 /// pane. A terminal editor draws in the pane and is given it.
 struct Dialect {
     names: &'static [&'static str],
@@ -90,7 +90,7 @@ const DIALECTS: &[Dialect] = &[
 /// wants the terminal.
 ///
 /// A terminal editor paints in the pane and must be handed it outright. A window one draws in an
-/// instance of its own and never reads the terminal, so reviewr keeps it.
+/// instance of its own and never reads the terminal, so Diple keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorCommand {
     pub program: String,
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn window_editors_get_their_line_and_nothing_else() {
-        // reviewr adds no flag of its own: the launcher hands the file over and returns, and
+        // Diple adds no flag of its own: the launcher hands the file over and returns, and
         // nothing waits on it.
         for name in ["code", "code-insiders", "codium", "cursor", "windsurf", "positron"] {
             assert_eq!(argv(&env(name).unwrap()), format!("{name} -g /repo/src/lib.rs:41"));

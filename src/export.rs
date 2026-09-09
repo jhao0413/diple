@@ -1,4 +1,4 @@
-//! Formatting comments and exporting them to the agent or clipboard.
+//! Formatting comments and exporting them to the clipboard or stdout boundary.
 //!
 //! A comment becomes a block of `location`, the
 //! diff snippet, then the text. Export is consume-on-success: the caller removes
@@ -9,7 +9,6 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
-use crate::herdr;
 use crate::model::Comment;
 
 /// One comment as its export block: location, snippet, then text.
@@ -109,48 +108,10 @@ fn select_tool(
     tools.iter().copied().find(|(cmd, _)| present(cmd))
 }
 
-/// One chosen agent pane: fill its input via `herdr pane send-text`, then focus it.
-///
-/// The pane is decided before the export runs, by the sole-agent path or by the picker, and
-/// nothing re-resolves it here. A pane that closed in between fails the send and keeps every
-/// comment.
-#[derive(Clone, Debug)]
-pub struct Agent {
-    pub pane: String,
-    pub name: String,
-}
-
-impl ExportTarget for Agent {
-    fn label(&self) -> &'static str {
-        "agent"
-    }
-
-    /// Names the agent it addressed. The send is irreversible and consumes the whole set, so
-    /// this line is the reviewer's only record of where the review went.
-    fn success_message(&self, count: usize) -> String {
-        format!("added {} to {}", counted_comments(count), self.name)
-    }
-
-    /// The pane was resolved before the send and closed in between, which is the only way this
-    /// happens in practice. herdr's own wording is a JSON envelope around a pane id, so the
-    /// reviewer gets this instead and the payload goes to the log.
-    fn failure_message(&self) -> String {
-        "agent not found".to_string()
-    }
-
-    fn export(&self, text: &str) -> Result<()> {
-        herdr::send_text(&self.pane, text)?;
-        // Focus is a convenience once the text is delivered; a focus failure must NOT fail the
-        // export, or the comments stay unconsumed and the next Send duplicates the whole review.
-        let _ = herdr::focus(&self.pane);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, select_tool,
+        CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, select_tool,
     };
     use crate::model::{Comment, Side};
 
@@ -172,11 +133,6 @@ mod tests {
 
     #[test]
     fn export_confirmations_name_the_actual_result_and_pluralize_comments() {
-        // The agent line names the pane it addressed, so a mis-send is visible the moment it
-        // lands.
-        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
-        assert_eq!(agent.success_message(1), "added 1 comment to release-bot");
-        assert_eq!(agent.success_message(2), "added 2 comments to release-bot");
         assert_eq!(Clipboard.success_message(1), "copied 1 comment");
         assert_eq!(Clipboard.success_message(2), "copied 2 comments");
     }

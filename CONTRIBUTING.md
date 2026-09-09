@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for wanting to make reviewr better. This page gets you from clone to merged PR.
+Thanks for wanting to make Diple better. This page gets you from clone to merged PR.
 
 ## Setup
 
@@ -8,10 +8,10 @@ You need Rust (the exact toolchain is pinned by `rust-toolchain.toml` and instal
 first build) and [`just`](https://github.com/casey/just).
 
 ```bash
-git clone https://github.com/persiyanov/herdr-reviewr
-cd herdr-reviewr
+git clone https://github.com/jhao0413/diple
+cd diple
 just test          # the test suite
-just run           # run reviewr against this repo
+just run           # run Diple against this repo
 cargo run -- ~/some/repo   # or against any repo
 ```
 
@@ -22,10 +22,6 @@ release build. Green there means green in CI.
 to test the `e` key: unit tests stop at the editor's argv, and everything past it is terminal
 state. Run it after any change to `run_editor`, the terminal mode stack, or the editor dialects.
 It takes about a minute.
-
-To test a change inside real herdr panes, `just qa-install` swaps your build into the installed
-plugin and `just qa-restore` brings the release back. The details and the sharp edges live in
-`docs/qa-install.md`.
 
 ## How this repo works
 
@@ -41,7 +37,7 @@ reading the release page.
 painted frame:
 
 ```bash
-python3 scripts/bench_tui.py --binary target/release/herdr-reviewr --fixture
+python3 scripts/bench_tui.py --binary target/release/diple --fixture
 ```
 
 The one committed baseline is `scripts/bench-results/baseline.json`. Replace it when a change
@@ -59,6 +55,6 @@ component calls.
 
 ## Releasing
 
-Maintainers only — the process is `docs/RELEASING.md` in full. Short version: bump two versions,
-finalize the changelog, tag `vX.Y.Z`, and CI builds the binaries and publishes the release with
-the changelog section as its notes.
+Maintainers only — the process is `docs/RELEASING.md` in full. Short version: bump the package
+version, finalize the changelog, tag `vX.Y.Z`, and CI builds the binaries and publishes the
+release with the changelog section as its notes.

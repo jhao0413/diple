@@ -504,7 +504,7 @@ pub enum PrInputError {
 pub fn fetch_input(
     repo: &Path,
     base: Option<&str>,
-    config: &crate::config::PluginConfig,
+    config: &crate::config::AppConfig,
 ) -> Result<PrFetchInput, PrInputError> {
     fetch_input_inner(repo, base, config, false)
 }
@@ -513,7 +513,7 @@ pub fn fetch_input(
 pub(crate) fn verify_input(
     repo: &Path,
     base: Option<&str>,
-    config: &crate::config::PluginConfig,
+    config: &crate::config::AppConfig,
 ) -> Result<PrFetchInput, PrInputError> {
     fetch_input_inner(repo, base, config, true)
 }
@@ -521,7 +521,7 @@ pub(crate) fn verify_input(
 fn fetch_input_inner(
     repo: &Path,
     base: Option<&str>,
-    config: &crate::config::PluginConfig,
+    config: &crate::config::AppConfig,
     verify_repository: bool,
 ) -> Result<PrFetchInput, PrInputError> {
     let (repository, origin_repository) =

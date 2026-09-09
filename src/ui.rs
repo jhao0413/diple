@@ -25,7 +25,6 @@ use crate::diff::{FileDiff, FileState, Row};
 use crate::file_list::{Annotation, RowKind};
 use crate::forge;
 use crate::git;
-use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
 use crate::model::Comment;
 use crate::snippet::{snippet_caption_sign, snippet_row_is_comment};
@@ -81,7 +80,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // `body_popup`, so the footer just drawn stays uncovered and keeps advertising their keys.
     let popup: Option<fn(&mut Frame, &App, Rect)> = match app.mode {
         Mode::List => Some(render_comments_list),
-        Mode::Picker => Some(render_agent_picker),
+        Mode::ConfirmSend => Some(render_send_confirm),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
@@ -1537,7 +1536,6 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
         let gone = app.commits_gone_message();
         let msg = match app.tab {
             Tab::AllFiles => "no files",
-            Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
             Tab::Changes if app.commits_gone() => gone.as_str(),
             _ => "no changes",
         };
@@ -1558,6 +1556,15 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
             let fill = (i == app.file_cursor).then(|| p.cursor_bg(app.focus == Focus::Files));
             let nest = "  ".repeat(row.depth);
             match &row.kind {
+                RowKind::Group { label, count } => {
+                    let style = Style::default().fg(p.dim1).add_modifier(Modifier::BOLD);
+                    selectable_row(
+                        p,
+                        vec![Span::styled(format!("{label} {count}"), style)],
+                        width,
+                        None,
+                    )
+                }
                 RowKind::Dir { expanded, .. } => {
                     let arrow = if *expanded { "▾ " } else { "▸ " };
                     // A git-ignored directory recedes into a dim, unbolded row.
@@ -1816,7 +1823,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.visible.is_empty() {
         // `All files` is a content browser, not a diff, so its empty/notice copy avoids diff
-        // vocabulary and never shows the last-turn "waiting" state.
+        // vocabulary and never shows scope-specific empty-state wording.
         let gone = app.commits_gone_message();
         let msg = match app.tab {
             Tab::AllFiles => match app.diff.state {
@@ -1825,7 +1832,6 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
                 FileState::Normal if app.diff_path.is_some() => "empty file",
                 FileState::Normal => "select a file to read",
             },
-            Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
             Tab::Changes if app.commits_gone() => gone.as_str(),
             _ => match app.diff.state {
                 FileState::Binary => "binary — no line comments",
@@ -2536,6 +2542,17 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::MoveLine => (format!("{} {}", hint(K::Down), hint(K::Up)), ""),
         A::MoveHunk => (format!("{} {}", hint(K::NextHunk), hint(K::PrevHunk)), "hunk"),
         A::MoveFile => (format!("{} {}", hint(K::NextFile), hint(K::PrevFile)), "file"),
+        A::ToggleStage => {
+            let label = if app
+                .current_entry()
+                .is_some_and(|entry| entry.group == Some(crate::file_list::ListGroup::Staged))
+            {
+                "unstage"
+            } else {
+                "stage"
+            };
+            (hint(K::ToggleStage), label)
+        }
         A::MovePage => (format!("{} {}", hint(K::PageUp), hint(K::PageDown)), ""),
         A::ExpandDir => (hint(K::Expand), "expand"),
         A::CollapseDir => (hint(K::Collapse), "collapse"),
@@ -2549,25 +2566,21 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         }
         A::Scope => (
             format!(
-                "{}/{}/{}/{}",
+                "{}/{}/{}",
                 hint(K::ScopeUncommitted),
                 hint(K::ScopeBranch),
-                hint(K::ScopeLastTurn),
                 hint(K::ScopeCommits)
             ),
             "scope",
         ),
         A::Send => return (hint(K::Send), format!("send {}", app.store.len())),
+        A::ConfirmSend => ("enter".into(), "send"),
         A::List => (hint(K::Comments), "comments"),
         A::Copy => (hint(K::Copy), "copy"),
         A::Save => ("enter".into(), "save"),
         A::Newline => ("shift+enter".into(), "newline"),
         A::Cancel | A::ClosePicker => ("esc".into(), "cancel"),
         A::CloseList | A::CloseSearch | A::CloseFind => ("esc".into(), "close"),
-        A::PickAgent => ("enter".into(), "send"),
-        // The digits are literal, so they are spelled; the two movement keys are bound, so they
-        // read off the keymap like every other hint.
-        A::MovePickerRow => (format!("1-9 {} {}", hint(K::Down), hint(K::Up)), "move"),
         A::BasePick => (hint(K::BasePick), "base"),
         A::CommitPick => (hint(K::CommitPick), "commits"),
         A::PickCommitRun => {
@@ -2584,7 +2597,6 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             let others: Vec<String> = [
                 (Scope::Uncommitted, K::ScopeUncommitted),
                 (Scope::Branch, K::ScopeBranch),
-                (Scope::LastTurn, K::ScopeLastTurn),
                 (Scope::Commits, K::ScopeCommits),
             ]
             .into_iter()
@@ -2999,99 +3011,29 @@ fn menu_hit(
     (index < total).then_some(index)
 }
 
-fn picker_popup(area: Rect, app: &App) -> Rect {
-    let name_width = picker_name_width(app);
-    // " N  " + the padded name + "  " + the dim trail. The highlight is a row fill, not a
-    // glyph, so it costs no width.
-    let widest = app
-        .picker_rows
-        .iter()
-        .map(|row| 4 + name_width + 2 + picker_trail(app, row).width())
-        .max()
-        .unwrap_or(0);
-    menu_popup(area, app, widest, &picker_title(app), app.picker_rows.len() + 2)
+fn render_send_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let count = app.store.len();
+    let noun = if count == 1 { "comment" } else { "comments" };
+    let title = "send review";
+    let popup = menu_popup(area, app, 52, title, 5);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.purple))
+        .title(framed_title(title));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let message = format!(
+        "Write {count} {noun} to stdout and exit?\n\nPress Enter to send, Esc to keep reviewing."
+    );
+    frame.render_widget(Paragraph::new(message).style(text_style(p)), inner);
 }
 
 /// The popup's row region, from the same `Block` shape the renderer draws, so the hit test
 /// and the painted rows can never disagree about where a row starts.
 fn picker_inner(popup: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(popup)
-}
-
-/// The names pad to the widest, so the dim tails start in one column.
-fn picker_name_width(app: &App) -> usize {
-    app.picker_rows.iter().map(|row| row.name.width()).max().unwrap_or(0)
-}
-
-/// A row's dim trail: the state, ` · <tab>` when herdr gave the tab a label, and ` · last used`
-/// on the row of the agent this session last sent to — the remembered default reads before an
-/// irreversible `enter` fires it.
-fn picker_trail(app: &App, row: &AgentChoice) -> String {
-    let tab = if row.tab.is_empty() { String::new() } else { format!(" · {}", row.tab) };
-    let last =
-        if app.last_sent_pane.as_deref() == Some(&row.pane_id) { " · last used" } else { "" };
-    format!("{}{tab}{last}", row.state)
-}
-
-fn picker_title(app: &App) -> String {
-    let n = app.store.len();
-    let noun = if n == 1 { "comment" } else { "comments" };
-    format!("send {n} {noun} to")
-}
-
-fn picker_scroll(app: &App, rows: usize) -> usize {
-    menu_scroll(app.picker_cursor, app.picker_rows.len(), rows)
-}
-
-fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
-    let p = app.palette();
-    let popup = picker_popup(area, app);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.purple))
-        .title(framed_title(&picker_title(app)));
-    let inner = picker_inner(popup);
-    frame.render_widget(block, popup);
-
-    let name_width = picker_name_width(app);
-    let first = picker_scroll(app, inner.height as usize);
-    let items: Vec<ListItem> = app
-        .picker_rows
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(inner.height as usize)
-        .map(|(i, row)| {
-            // Only the first nine rows carry a number, since no digit key reaches further.
-            let lead = if i < 9 { format!(" {}  ", i + 1) } else { "    ".to_string() };
-            let pad = name_width.saturating_sub(row.name.width());
-            let spans = vec![
-                Span::styled(lead, Style::default().fg(p.dim2)),
-                // The name is the only part at full brightness: it is what the reviewer scans
-                // for, and the two weights are what keep this a picker rather than a table.
-                Span::styled(row.name.clone(), text_style(p)),
-                Span::styled(
-                    format!("{}  {}", " ".repeat(pad), picker_trail(app, row)),
-                    Style::default().fg(p.dim2),
-                ),
-            ];
-            selectable_row(
-                p,
-                spans,
-                inner.width as usize,
-                (i == app.picker_cursor).then_some(p.surface2),
-            )
-        })
-        .collect();
-    frame.render_widget(List::new(items), inner);
-}
-
-/// The picker row under the pointer, for click-to-highlight.
-pub fn hit_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
-    let inner = picker_inner(picker_popup(area, app));
-    let first = picker_scroll(app, inner.height as usize);
-    menu_hit(inner, 0, first, app.picker_rows.len(), col, row)
 }
 
 // --- Base picker ----------------------------------------------
@@ -3124,7 +3066,7 @@ fn base_row_width(row: &crate::app::BaseChoice) -> usize {
     3 + row_shown(row).width() + trail_w
 }
 
-/// Sized like the agent picker's box, plus the filter line above the rows. The box holds its
+/// Sized like the base picker's box, plus the filter line above the rows. The box holds its
 /// full-list size while the filter narrows, so the frame never jumps under typing.
 fn base_picker_popup(area: Rect, app: &App) -> Rect {
     let Some(bp) = &app.base_picker else { return Rect::default() };
@@ -3198,7 +3140,7 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
         .take(list_area.height as usize)
         .map(|(vi, row)| {
             // The star marks the open PR's target; the name is the only part at full
-            // brightness, like the agent picker's rows. The dim
+            // brightness, like the base picker's rows. The dim
             // trail right-aligns to the row so a probe and the full list put `(sha)`
             // in the same place.
             let lead = if row.starred() { " ★ " } else { "   " };

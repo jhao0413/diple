@@ -9,11 +9,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use herdr_reviewr::diff::DiffCache;
-use herdr_reviewr::git;
-use herdr_reviewr::highlight::Highlighter;
-use herdr_reviewr::model::Scope;
-use herdr_reviewr::theme;
+use diple::diff::DiffCache;
+use diple::git;
+use diple::highlight::Highlighter;
+use diple::model::Scope;
+use diple::theme;
 
 fn ms(f: impl FnOnce()) -> f64 {
     let t = Instant::now();
@@ -64,13 +64,6 @@ fn main() {
             git::all_files(&repo).unwrap();
         }),
     );
-    row(
-        "snapshot_worktree (poll during turn)",
-        sample(3, || {
-            git::snapshot_worktree(&repo).unwrap();
-        }),
-    );
-
     // --- File opens -------------------------------------------------------------
     // Pick representative text files by on-disk size: the median, and the largest
     // comfortably under the 2 MB diff byte budget so the open exercises a full

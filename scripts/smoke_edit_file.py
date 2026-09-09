@@ -5,7 +5,7 @@ Unit tests stop at the argv. Everything after it is terminal state: leaving the 
 screen, releasing raw mode, and rebuilding both on return. Only a real PTY shows that, so this
 drives the real binary with a scripted editor and checks the bytes on the wire.
 
-    python3 scripts/smoke_edit_file.py --binary target/release/herdr-reviewr
+    python3 scripts/smoke_edit_file.py --binary target/release/diple
 
 Exits 0 when every check passes, 1 with the failing check named otherwise.
 """
@@ -24,7 +24,7 @@ import termios
 import time
 
 ROWS, COLS = 40, 120
-# Every session reads a config dir. Left unset, reviewr falls back to the real installed one
+# Every session reads a config dir. Left unset, Diple falls back to the real installed one
 # and the suite would run against whatever the machine's own `editor` key says — opening the
 # reviewer's actual editor. `main` points this at an empty directory before any session starts.
 NO_CONFIG = None
@@ -71,7 +71,7 @@ def make_editor(bindir, argv_log, name, holds=0):
     """A scripted `$EDITOR` under a real editor's name, so its dialect resolves.
 
     Records its argv, writes to the file, and prints to the terminal. It lives outside the
-    repository, or reviewr would list it as an untracked change and open it instead. `holds`
+    repository, or Diple would list it as an untracked change and open it instead. `holds`
     seconds stand in for the time a reviewer spends with the file open.
     """
     os.makedirs(bindir, exist_ok=True)
@@ -81,7 +81,7 @@ def make_editor(bindir, argv_log, name, holds=0):
             "#!/bin/sh\n"
             f'printf "%s\\n" "$@" > {argv_log}\n'
             f'printf "cwd=%s\\npath=%s\\n" "$PWD" "$PATH" > {argv_log}.env\n'
-            # Proof the editor owns a real terminal: this reaches the screen only if reviewr
+            # Proof the editor owns a real terminal: this reaches the screen only if Diple
             # actually left the alternate screen.
             'printf "FAKE-EDITOR-IS-ON-SCREEN\\n"\n'
             # The last argument carries the path in every dialect, bare or `path:line`.
@@ -107,7 +107,7 @@ class Session:
         if visual:
             env["VISUAL"] = visual
         # Never the machine's own: an empty directory is the missing-file default.
-        env["HERDR_PLUGIN_CONFIG_DIR"] = config_dir or NO_CONFIG
+        env["DIPLE_CONFIG_DIR"] = config_dir or NO_CONFIG
         self.proc = subprocess.Popen(
             [binary, repo, "--poll", str(poll)],
             stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
@@ -166,7 +166,7 @@ class Session:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default="target/release/herdr-reviewr")
+    ap.add_argument("--binary", default="target/release/diple")
     args = ap.parse_args()
     binary = os.path.abspath(args.binary)
     if not os.path.exists(binary):
@@ -198,7 +198,7 @@ def main():
         before = len(s.seen)
         os.write(s.master, b"e")
         time.sleep(0.7)  # the editor owns the pane by now
-        # Type-ahead, and the editor's own teardown queries answer in the same bytes: reviewr
+        # Type-ahead, and the editor's own teardown queries answer in the same bytes: Diple
         # must discard what was buffered rather than read `q` as a command on the way back.
         os.write(s.master, b"q")
         # Read until the pane is back: the editor is still holding it when the quiet window
@@ -209,7 +209,7 @@ def main():
         s.drain()
         after = s.seen[before:]
         check("what was typed while the editor held the pane is discarded",
-              s.proc.poll() is None, "reviewr acted on the buffered key and exited")
+              s.proc.poll() is None, "Diple acted on the buffered key and exited")
 
         check("`e` leaves the alternate screen", ALT_LEAVE in after)
         check("the editor's own output reaches the terminal",
@@ -299,13 +299,13 @@ def main():
         if os.path.exists(gui_log):
             with open(gui_log) as f:
                 gui_argv = [line.rstrip("\n") for line in f]
-        check("a window editor is told no flag reviewr invented",
+        check("a window editor is told no flag Diple invented",
               not any(a.startswith("--wait") or a.startswith("--block") for a in gui_argv),
               f"argv={gui_argv}")
         check("and takes its line as --goto path:line",
               "-g" in gui_argv and bool(gui_argv) and ":" in gui_argv[-1],
               f"argv={gui_argv}")
-        # It never reads the terminal, so reviewr keeps it: the reviewer keeps the diff on
+        # It never reads the terminal, so Diple keeps it: the reviewer keeps the diff on
         # screen, and raw mode stays on so a `ctrl+c` in the pane cannot signal the process.
         gui_after = plain(s.seen[gui_mark:])
         check("and the pane is never handed to it", ALT_LEAVE not in s.seen[gui_mark:])

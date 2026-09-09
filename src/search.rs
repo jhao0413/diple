@@ -1,6 +1,6 @@
 //! The search worker: the `fff-search` engine behind request/completion channels.
 //!
-//! The engine owns matching, ranking, and indexing; reviewr passes the query through and
+//! The engine owns matching, ranking, and indexing; Diple passes the query through and
 //! renders results in the engine's order. The worker owns the picker and
 //! its background scan, so a query never runs on the frame loop. Completions are
 //! generation-tagged and land latest-wins, like the world worker's.
@@ -27,7 +27,7 @@ const WARMUP_POLL: Duration = Duration::from_millis(50);
 
 /// The engine's cache home. The frecency store lives here, never the worktree
 pub fn cache_dir() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("herdr-reviewr")
+    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("diple")
 }
 
 /// One request to the worker.

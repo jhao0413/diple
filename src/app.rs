@@ -12,11 +12,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::diff::{DiffCache, FileDiff, Row, View};
-use crate::export::{Agent, ExportTarget, format_all};
-use crate::file_list::{self, Annotation, Entry, RowKind};
+use crate::export::{ExportTarget, format_all};
+use crate::file_list::{self, Annotation, Entry, ListGroup, RowKind};
 use crate::forge;
 use crate::git;
-use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
 use crate::logln;
 use crate::model::{Comment, CommentStore, CommitPick, Rev, Scope, Side};
@@ -57,7 +56,7 @@ pub enum Focus {
 /// What the file-list cursor points at, by path, so it can be restored to the same target
 /// after the tree rebuilds on a poll.
 enum Anchor {
-    File(String),
+    File(String, Option<ListGroup>),
     Dir(String),
 }
 
@@ -71,8 +70,8 @@ pub enum Tab {
 }
 
 /// What a pending PR refresh may do to a fetch already in flight: an ambient trigger —
-/// tab entry, a turn end, the fallback timer — rides it, the user's `refresh` key
-/// supersedes it. `Ord` so merging pending requests keeps the
+/// tab entry or a fallback timer — rides it, while the user's `refresh` key supersedes it.
+/// `Ord` lets merging pending requests keep the
 /// stronger kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RefreshKind {
@@ -101,6 +100,7 @@ struct TabStash {
     visible: Vec<Row>,
     expanded_folds: HashSet<u32>,
     diff_path: Option<String>,
+    diff_group: Option<ListGroup>,
     diff_cursor: usize,
     diff_scroll: usize,
     h_scroll: usize,
@@ -121,6 +121,7 @@ struct TabStash {
 struct ArmedCross {
     forward: bool,
     path: String,
+    group: Option<ListGroup>,
 }
 
 /// The base picker's state while it is open. The rows freeze
@@ -315,9 +316,8 @@ pub enum Mode {
     },
     /// Browsing the comments-list overlay.
     List,
-    /// Choosing which agent a `Send` goes to. Its rows and highlight
-    /// live in [`App::picker_rows`] and [`App::picker_cursor`].
-    Picker,
+    /// Confirm that the review should be emitted to stdout and the session closed.
+    ConfirmSend,
     /// Choosing the `branch` scope's base. Its state lives in
     /// [`App::base_picker`].
     BasePick,
@@ -342,7 +342,11 @@ impl Mode {
     pub fn is_modal(&self) -> bool {
         matches!(
             self,
-            Mode::Composing { .. } | Mode::List | Mode::Picker | Mode::BasePick | Mode::CommitPick
+            Mode::Composing { .. }
+                | Mode::List
+                | Mode::ConfirmSend
+                | Mode::BasePick
+                | Mode::CommitPick
         )
     }
 }
@@ -509,6 +513,7 @@ pub enum FooterAction {
     MoveLine,
     MoveHunk,
     MoveFile,
+    ToggleStage,
     MovePage,
     ExpandDir,
     CollapseDir,
@@ -543,10 +548,7 @@ pub enum FooterAction {
     Newline,
     Cancel,
     CloseList,
-    /// The agent picker's own bar: send to the highlight, move it, and cancel
-    /// The digits are literal here, so the move hint names them.
-    PickAgent,
-    MovePickerRow,
+    ConfirmSend,
     ClosePicker,
     /// Open the base picker.
     BasePick,
@@ -662,6 +664,8 @@ pub struct App {
     /// The file the open diff belongs to — the diff title, frozen with the diff
     /// while composing even if `file_cursor` drifts as the file list updates.
     pub diff_path: Option<String>,
+    /// The index/worktree section that owns the open uncommitted diff.
+    pub diff_group: Option<ListGroup>,
     pub diff_cursor: usize,
     /// Top visible diff line. Sticky: only moves to keep the cursor in view, so the
     /// diff does not jump on every cursor step and drag-selection stays stable.
@@ -733,16 +737,8 @@ pub struct App {
     view_reload_held: bool,
     pub store: CommentStore,
     pub list_cursor: usize,
-    /// The picker's rows, frozen at the moment it opened. A refresh behind it adds, drops,
-    /// and reorders nothing.
-    pub picker_rows: Vec<AgentChoice>,
-    pub picker_cursor: usize,
-    /// The mode the picker opened over — `Normal`, the comments list, or the find band —
-    /// so closing it restores the view the reviewer sent from.
-    pub picker_over: Mode,
-    /// The agent this session last sent to, which arms the picker's highlight. Only a
-    /// successful send sets it.
-    pub last_sent_pane: Option<String>,
+    /// The view restored when stdout-send confirmation is cancelled.
+    pub send_over: Mode,
     /// The base picker's rows, filter, and highlight while `Mode::BasePick` is open
     pub base_picker: Option<BasePicker>,
     pub mode: Mode,
@@ -755,6 +751,8 @@ pub struct App {
     /// recovery (Continuity).
     pub keys_expanded: bool,
     pub should_quit: bool,
+    /// Filled only after the explicit send confirmation; `run` writes it after restoring the TUI.
+    pub send_output: Option<String>,
     /// The read-only `PR` tab's view of the pull request.
     pub pr: forge::PrView,
     /// The resolved repository target's forge, from the latest input probe. Display strings
@@ -809,8 +807,8 @@ pub struct App {
     theme_name: &'static str,
     /// The `--theme` override name (highest precedence); `None` lets the config file decide.
     cli_theme_name: Option<String>,
-    /// The plugin is either ready with one validated snapshot or wholly blocked on its error.
-    config: PluginConfigState,
+    /// The app is either ready with one validated configuration or wholly blocked on its error.
+    config: AppConfigState,
     /// The last theme name requested, so re-resolving the same name skips work and logging.
     requested_theme_name: Option<String>,
     cache: DiffCache,
@@ -819,16 +817,6 @@ pub struct App {
     /// `&App`; cleared with the diff cache on a theme switch.
     markdown_cache: std::cell::RefCell<crate::markdown::RenderCache>,
     snippet_cache: std::cell::RefCell<crate::snippet::SnippetRowCache>,
-    /// The worker-owned turn baseline, mirrored from completions so the sync `last-turn`
-    /// paths (the diff's old side, the scope-switch rebuild) read it without a round-trip.
-    turn_baseline: Option<String>,
-    /// Whether any agent is in this worktree — the one home for the answer, held here
-    /// because this is what paints it. `None` until a sample observes it, so a frame that
-    /// has seen nothing waits instead of asserting an emptiness nobody looked for: stale is
-    /// allowed, wrong is not (Continuity). Only a sample that observed the
-    /// whole worktree moves it — herdr answered and git resolved every member's directory — so
-    /// `Some(false)` always means someone looked and found no member.
-    agents_present: Option<bool>,
 }
 
 /// One painted link region: `x_start..x_end` on screen row `y`, in absolute cells.
@@ -841,8 +829,8 @@ struct PaintedLink {
 }
 
 #[derive(Debug)]
-enum PluginConfigState {
-    Ready(crate::config::PluginConfig),
+enum AppConfigState {
+    Ready(crate::config::AppConfig),
     Blocked { error: String },
 }
 
@@ -851,16 +839,12 @@ impl App {
         Self::build(repo, scope, base, true)
     }
 
-    /// Construct the error-only reviewr pane without reading repository state.
+    /// Construct the error-only Diple pane without reading repository state.
     pub(crate) fn blocked(repo: PathBuf, scope: Scope, base: Option<String>) -> Self {
         Self::build(repo, scope, base, false)
     }
 
-    fn build(repo: PathBuf, scope: Scope, base: Option<String>, load_turn: bool) -> Self {
-        // Mirror any persisted turn baseline for this worktree, so `last-turn` keeps its
-        // anchor across a reviewr pane restart. The worker's `TurnHost` owns the tracker; this
-        // mirror follows its completions.
-        let turn_baseline = if load_turn { crate::world::seed_baseline(&repo) } else { None };
+    fn build(repo: PathBuf, scope: Scope, base: Option<String>, _load_turn: bool) -> Self {
         let theme = theme::resolve(None);
         Self {
             repo,
@@ -889,6 +873,7 @@ impl App {
             visible: Vec::new(),
             expanded_folds: HashSet::new(),
             diff_path: None,
+            diff_group: None,
             diff_cursor: 0,
             diff_scroll: 0,
             h_scroll: 0,
@@ -917,10 +902,7 @@ impl App {
             select_anchor: None,
             store: CommentStore::new(),
             list_cursor: 0,
-            picker_rows: Vec::new(),
-            picker_cursor: 0,
-            picker_over: Mode::Normal,
-            last_sent_pane: None,
+            send_over: Mode::Normal,
             base_picker: None,
             mode: Mode::Normal,
             input: String::new(),
@@ -928,6 +910,7 @@ impl App {
             status: String::new(),
             keys_expanded: false,
             should_quit: false,
+            send_output: None,
             pr: forge::PrView::Pending,
             pr_forge: crate::git::Forge::GitHub,
             pr_notice: None,
@@ -951,13 +934,11 @@ impl App {
             palette: theme.palette,
             theme_name: theme.name,
             cli_theme_name: None,
-            config: PluginConfigState::Ready(crate::config::PluginConfig::default()),
+            config: AppConfigState::Ready(crate::config::AppConfig::default()),
             requested_theme_name: None,
             cache: DiffCache::new(),
             markdown_cache: std::cell::RefCell::new(crate::markdown::RenderCache::default()),
             snippet_cache: std::cell::RefCell::new(crate::snippet::SnippetRowCache::default()),
-            turn_baseline,
-            agents_present: None,
         }
     }
 
@@ -988,47 +969,46 @@ impl App {
         self.refresh_theme();
     }
 
-    /// Apply one complete validated plugin configuration snapshot.
-    pub fn set_plugin_config(&mut self, config: crate::config::PluginConfig) {
-        let previous_position =
-            self.plugin_config().map(crate::config::PluginConfig::navigator_position);
+    /// Apply one complete validated configuration snapshot.
+    pub fn set_app_config(&mut self, config: crate::config::AppConfig) {
+        let previous_position = self.app_config().map(crate::config::AppConfig::navigator_position);
         let next_position = config.navigator_position();
-        self.config = PluginConfigState::Ready(config);
+        self.config = AppConfigState::Ready(config);
         if previous_position != Some(next_position) {
             self.cancel_divider_drag();
             self.navigator_position = next_position;
         }
         // A config layout or theme change also completes a live gesture's copy — that runs at
         // the observation boundary, where the painted frame is still in reach
-        // (`lib.rs::reconcile_plugin_config`).
+        // (`lib.rs::reconcile_app_config`).
         self.refresh_theme();
     }
 
-    /// The validated plugin configuration snapshot normal work currently uses.
-    pub fn plugin_config(&self) -> Option<&crate::config::PluginConfig> {
+    /// The validated configuration snapshot normal work currently uses.
+    pub fn app_config(&self) -> Option<&crate::config::AppConfig> {
         match &self.config {
-            PluginConfigState::Ready(config) => Some(config),
-            PluginConfigState::Blocked { .. } => None,
+            AppConfigState::Ready(config) => Some(config),
+            AppConfigState::Blocked { .. } => None,
         }
     }
 
-    /// Block the reviewr pane on one whole-file configuration failure.
+    /// Block the Diple pane on one whole-file configuration failure.
     pub fn set_config_error(&mut self, error: String) {
         self.cancel_divider_drag();
         // The config view replaces the body, ending any gesture over it. The observation
         // boundary completes a visible selection's copy first
-        // (`lib.rs::reconcile_plugin_config`); this cancel is the backstop for every other
+        // (`lib.rs::reconcile_app_config`); this cancel is the backstop for every other
         // caller, so the blocked pane never holds a live gesture (CFG-BLOCKED-INERT).
         self.cancel_gesture();
-        // The search overlay, the find band, and the agent picker close when the config view
+        // The search overlay, the find band, and send confirmation close when the config view
         // takes over; recovery restores the tab beneath them. The query is not restored, and
         // neither are the picker's frozen rows, which would be stale by then.
         // The picker closes first, onto the mode it opened over, so the two closers below then
         // tear down that mode's own state instead of leaving it restored but emptied.
-        self.close_picker();
+        self.cancel_send();
         self.close_search();
         self.close_find();
-        self.config = PluginConfigState::Blocked { error };
+        self.config = AppConfigState::Blocked { error };
         self.pr_pending = None;
     }
 
@@ -1037,16 +1017,16 @@ impl App {
     /// loop's error gate answers the default `quit` key itself (`lib.rs`).
     pub fn keymap(&self) -> &crate::keymap::Keymap {
         match &self.config {
-            PluginConfigState::Ready(config) => config.keymap(),
-            PluginConfigState::Blocked { .. } => crate::keymap::default_keymap(),
+            AppConfigState::Ready(config) => config.keymap(),
+            AppConfigState::Blocked { .. } => crate::keymap::default_keymap(),
         }
     }
 
-    /// The error-only state rendered while plugin configuration is invalid.
+    /// The error-only state rendered while Diple configuration is invalid.
     pub fn config_error(&self) -> Option<&str> {
         match &self.config {
-            PluginConfigState::Ready(_) => None,
-            PluginConfigState::Blocked { error, .. } => Some(error),
+            AppConfigState::Ready(_) => None,
+            AppConfigState::Blocked { error, .. } => Some(error),
         }
     }
 
@@ -1058,9 +1038,6 @@ impl App {
         self.list_cursor = old.list_cursor;
         // The footer expansion is one global toggle, carried regardless of the recovered mode
         self.keys_expanded = old.keys_expanded;
-        // The `last used` arming is session memory, like the comments themselves — a config
-        // error must not forget which agent the session sent to.
-        self.last_sent_pane = old.last_sent_pane.take();
         // The commit pick is session memory like the comments: replaced, never cleared
         self.commit_pick = old.commit_pick.take();
         self.navigator_side_pct = old.navigator_side_pct;
@@ -1078,11 +1055,15 @@ impl App {
         self.world_request = old.world_request.take();
         let old_mode = old.mode.clone();
         match old_mode {
-            // `set_config_error` closes the search overlay, the find band, and the agent picker
+            // `set_config_error` closes search, find, and send confirmation
             // before the mode is stored, so none reaches recovery; the search query is not
             // restored and the picker's frozen rows are not either.
-            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
-            Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
+            Mode::Normal | Mode::Search | Mode::Find => {}
+            Mode::List
+            | Mode::ConfirmSend
+            | Mode::Composing { .. }
+            | Mode::BasePick
+            | Mode::CommitPick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -1102,6 +1083,7 @@ impl App {
                 self.visible = std::mem::take(&mut old.visible);
                 self.expanded_folds = std::mem::take(&mut old.expanded_folds);
                 self.diff_path = old.diff_path.take();
+                self.diff_group = old.diff_group.take();
                 self.diff_cursor = old.diff_cursor;
                 self.diff_scroll = old.diff_scroll;
                 self.h_scroll = old.h_scroll;
@@ -1125,20 +1107,20 @@ impl App {
         }
     }
 
-    fn config_snapshot(&self) -> &crate::config::PluginConfig {
+    fn config_snapshot(&self) -> &crate::config::AppConfig {
         match &self.config {
-            PluginConfigState::Ready(config) => config,
-            PluginConfigState::Blocked { .. } => {
-                unreachable!("normal work is gated while plugin configuration is invalid")
+            AppConfigState::Ready(config) => config,
+            AppConfigState::Blocked { .. } => {
+                unreachable!("normal work is gated while Diple configuration is invalid")
             }
         }
     }
 
     fn ensure_config_ready(&self) -> Result<()> {
         match &self.config {
-            PluginConfigState::Ready(_) => Ok(()),
-            PluginConfigState::Blocked { error } => {
-                Err(anyhow::anyhow!("plugin configuration is invalid: {error}"))
+            AppConfigState::Ready(_) => Ok(()),
+            AppConfigState::Blocked { error } => {
+                Err(anyhow::anyhow!("Diple configuration is invalid: {error}"))
             }
         }
     }
@@ -1185,6 +1167,14 @@ impl App {
             .position(|r| r.file_index().is_some_and(|i| self.entries[i].path == path))
     }
 
+    fn file_row_of_identity(&self, path: &str, group: Option<ListGroup>) -> Option<usize> {
+        self.file_rows.iter().position(|row| {
+            row.file_index().is_some_and(|index| {
+                self.entries[index].path == path && self.entries[index].group == group
+            })
+        })
+    }
+
     /// The visible-row index of the first file row, the initial selection so a diff shows
     /// at once even when the tree opens on a directory.
     fn first_file_row(&self) -> Option<usize> {
@@ -1200,16 +1190,21 @@ impl App {
     /// What the cursor currently points at — a file (by path) or a directory (by path) — so
     /// the cursor can be put back on the same target after the tree rebuilds.
     fn cursor_anchor(&self) -> Option<Anchor> {
-        self.file_rows.get(self.file_cursor).map(|r| match &r.kind {
-            RowKind::File { index, .. } => Anchor::File(self.entries[*index].path.clone()),
-            RowKind::Dir { path, .. } => Anchor::Dir(path.clone()),
+        self.file_rows.get(self.file_cursor).and_then(|r| match &r.kind {
+            RowKind::File { index, .. } => {
+                Some(Anchor::File(self.entries[*index].path.clone(), self.entries[*index].group))
+            }
+            RowKind::Dir { path, .. } => Some(Anchor::Dir(path.clone())),
+            RowKind::Group { .. } => None,
         })
     }
 
     /// The visible-row index matching `anchor`, for restoring the cursor after a rebuild.
     fn row_of_anchor(&self, anchor: &Anchor) -> Option<usize> {
         self.file_rows.iter().position(|r| match (anchor, &r.kind) {
-            (Anchor::File(p), RowKind::File { index, .. }) => &self.entries[*index].path == p,
+            (Anchor::File(p, group), RowKind::File { index, .. }) => {
+                &self.entries[*index].path == p && &self.entries[*index].group == group
+            }
             (Anchor::Dir(p), RowKind::Dir { path, .. }) => path == p,
             _ => false,
         })
@@ -1223,7 +1218,10 @@ impl App {
             return Some(e.clone());
         }
         let open = self.diff_path.as_deref()?;
-        self.entries.iter().find(|e| e.path == open).cloned()
+        self.entries
+            .iter()
+            .find(|entry| entry.path == open && entry.group == self.diff_group)
+            .cloned()
     }
 
     /// Never touches the comment store or the in-progress input — that is the
@@ -1264,7 +1262,6 @@ impl App {
             scope: self.scope,
             base: self.base.clone(),
             base_epoch: self.base_epoch,
-            turn_baseline: self.turn_baseline.clone(),
             commit_pick: self.commit_pick.clone(),
             // `Changes` never reads the toggled set, so it stays out of that tab's tag —
             // a directory toggle there must not invalidate an in-flight build.
@@ -1302,7 +1299,12 @@ impl App {
         // A content change under the pointer resets the multi-click chain — the clicked
         // row's own text counts, so a same-length edit under the pointer breaks it too — while
         // a snapshot that changed nothing on screen leaves a double-click in flight alone
-        let view_before = (self.diff_path.clone(), self.visible.len(), self.clicked_target_text());
+        let view_before = (
+            self.diff_path.clone(),
+            self.diff_group,
+            self.visible.len(),
+            self.clicked_target_text(),
+        );
         // The preview's paint is a pure render of `preview_text`, so that string is the
         // settled highlight's staleness identity there; snapshot it only when a settled
         // `Painted` span exists to compare for.
@@ -1315,6 +1317,7 @@ impl App {
         // file, then the first file. The toggled-directory set survives untouched.
         let anchor = self.cursor_anchor();
         let open = self.diff_path.clone();
+        let open_group = self.diff_group;
         self.changed = snapshot.changed;
         self.entries = snapshot.entries;
         self.adopt_branch_base(snapshot.branch_base);
@@ -1322,7 +1325,9 @@ impl App {
         self.rebuild_file_rows();
         self.file_cursor = anchor
             .and_then(|a| self.row_of_anchor(&a))
-            .or_else(|| open.as_deref().and_then(|p| self.file_row_of_path(p)))
+            .or_else(|| {
+                open.as_deref().and_then(|path| self.file_row_of_identity(path, open_group))
+            })
             .or_else(|| self.first_file_row())
             .unwrap_or(0)
             .min(self.file_rows.len().saturating_sub(1));
@@ -1330,7 +1335,7 @@ impl App {
         // Explicit actions (navigation, a scope switch) request their own reveal.
         // While a modal is open the diff below it is frozen, so a poll can't shift the anchor
         // beneath the writer, reset the scroll and selection under the overlay, or move the
-        // reviewer's place while they choose an agent (`Mode::is_modal`, Continuity).
+        // reviewer's place while they use a modal (`Mode::is_modal`, Continuity).
         // A view-anchored drag holds it the same way, catching up when the gesture ends.
         // The file list still updates above.
         if self.view_anchored_gesture() {
@@ -1347,7 +1352,14 @@ impl App {
         if self.mode == Mode::Find && (open != self.diff_path || !self.find_available()) {
             self.close_find();
         }
-        if view_before != (self.diff_path.clone(), self.visible.len(), self.clicked_target_text()) {
+        if view_before
+            != (
+                self.diff_path.clone(),
+                self.diff_group,
+                self.visible.len(),
+                self.clicked_target_text(),
+            )
+        {
             self.last_click = None;
             // The open view's identity changed: whatever the settled highlight spanned is
             // gone from the screen, whichever surface it was on.
@@ -1395,7 +1407,10 @@ impl App {
     /// the diff view to the top, and it drops an armed crossing, which was armed at the edge
     /// of a file that is no longer the one on screen.
     fn reload_open_view(&mut self) {
-        if self.shown_entry().map(|e| e.path) != self.diff_path {
+        let shown = self.shown_entry();
+        let shown_identity = shown.as_ref().map(|entry| (entry.path.as_str(), entry.group));
+        let open_identity = self.diff_path.as_deref().map(|path| (path, self.diff_group));
+        if shown_identity != open_identity {
             self.reset_diff_view();
             self.armed_cross = None;
         }
@@ -1408,39 +1423,49 @@ impl App {
         let Some(entry) = self.shown_entry() else {
             self.diff = FileDiff::empty();
             self.diff_path = None;
+            self.diff_group = None;
             self.visible.clear();
             self.reset_diff_view();
             return;
         };
-        self.open_path_in_tab(entry.path, entry.previous_path);
+        self.open_path_in_tab(entry.path, entry.previous_path, entry.group);
     }
 
     /// Open `path` in the active tab's read pane: the scope diff in `Changes` (rename-aware via
     /// `previous_path`), the whole-file content in `All files`. The one place this dispatch lives,
     /// so opening a file from the tree and from a comment edit can't drift apart.
-    fn open_path_in_tab(&mut self, path: String, previous_path: Option<String>) {
+    fn open_path_in_tab(
+        &mut self,
+        path: String,
+        previous_path: Option<String>,
+        group: Option<ListGroup>,
+    ) {
         match self.tab {
             Tab::AllFiles => self.set_file_view(&path),
             // `Changes` (the `PR` tab never opens a file in the read pane).
-            _ => self.set_diff(path, previous_path),
+            _ => self.set_diff(path, previous_path, group),
         }
     }
 
     /// Build the diff for a specific `path` regardless of whether its row is visible in the
     /// tree — so editing a comment can surface its file even from a collapsed directory.
-    fn set_diff(&mut self, path: String, previous_path: Option<String>) {
+    fn set_diff(&mut self, path: String, previous_path: Option<String>, group: Option<ListGroup>) {
         // A different file opens with all folds collapsed and in source. `expanded_folds` is
         // keyed by line number, so without the clear a fold in the new file whose first hidden
         // line matches an expanded one in the old file would render pre-expanded. A same-file
         // poll or scope switch keeps both the folds and the preview choice.
-        if self.diff_path.as_deref() != Some(path.as_str()) {
+        let path_changed = self.diff_path.as_deref() != Some(path.as_str());
+        if path_changed || self.diff_group != group {
             self.expanded_folds.clear();
-            self.preview = false;
             self.preview_scroll = 0;
             self.preview_max_scroll.set(usize::MAX);
         }
+        if path_changed {
+            self.preview = false;
+        }
         self.diff_path = Some(path.clone());
-        let (old, new) = self.content_sides(&path, previous_path.as_deref());
+        self.diff_group = group;
+        let (old, new) = self.content_sides(&path, previous_path.as_deref(), group);
         self.diff = self.cache.get(path, previous_path, &old, &new, &self.highlighter);
         // Hold the new side as the preview's render input, the same current content the File
         // view previews. A non-markdown file, a notice, or a deleted file (empty new side)
@@ -1465,6 +1490,7 @@ impl App {
             self.preview_max_scroll.set(usize::MAX);
         }
         self.diff_path = Some(path.to_string());
+        self.diff_group = None;
         self.expanded_folds.clear(); // the File view has no folds
         let (diff, content) = self.file_view(path);
         // Keep the preview's render input current without a per-frame rebuild. A file the
@@ -1566,15 +1592,29 @@ impl App {
     /// The old and new content of `file` for the current scope: old from `HEAD` (or the
     /// merge-base on the branch scope), new from the worktree. A rename reads its old side
     /// from `previous_path`, so the diff shows real edits, not a wholesale delete-and-add.
-    fn content_sides(&self, path: &str, previous_path: Option<&str>) -> (String, String) {
+    fn content_sides(
+        &self,
+        path: &str,
+        previous_path: Option<&str>,
+        group: Option<ListGroup>,
+    ) -> (String, String) {
         let new_path = path;
         let old_path = previous_path.unwrap_or(new_path);
         match self.scope {
-            Scope::Uncommitted => {
-                let old = git::file_content(&self.repo, "HEAD", old_path);
-                let new = worktree_content(&self.repo, new_path);
-                (old, new)
-            }
+            Scope::Uncommitted => match group {
+                Some(ListGroup::Staged) => (
+                    git::file_content(&self.repo, "HEAD", old_path),
+                    git::index_content(&self.repo, new_path),
+                ),
+                Some(ListGroup::Working) => (
+                    git::index_content(&self.repo, new_path),
+                    worktree_content(&self.repo, new_path),
+                ),
+                None => (
+                    git::file_content(&self.repo, "HEAD", old_path),
+                    worktree_content(&self.repo, new_path),
+                ),
+            },
             Scope::Branch => {
                 let mb = self
                     .branch_base
@@ -1583,14 +1623,6 @@ impl App {
                     .and_then(|b| git::merge_base(&self.repo, b.oid()));
                 let old =
                     mb.map(|m| git::file_content(&self.repo, &m, old_path)).unwrap_or_default();
-                (old, worktree_content(&self.repo, new_path))
-            }
-            Scope::LastTurn => {
-                let old = self
-                    .turn_baseline
-                    .as_deref()
-                    .map(|b| git::file_content(&self.repo, b, old_path))
-                    .unwrap_or_default();
                 (old, worktree_content(&self.repo, new_path))
             }
             // Both sides from the commits: `A^` and `B`.
@@ -1637,52 +1669,11 @@ impl App {
         }
     }
 
-    /// Whether the `last-turn` scope is active but no baseline has been captured yet — the
-    /// cold-start state the UI paints as [`Self::turn_wait_message`].
-    pub fn awaiting_turn(&self) -> bool {
-        self.scope == Scope::LastTurn && self.turn_baseline.is_none()
-    }
-
-    /// The one message both panes paint for an [`Self::awaiting_turn`] frame, chosen here
-    /// so the file list and the diff view cannot disagree. An empty
-    /// worktree will never produce a turn, so saying so beats waiting — but only a sample
-    /// that found no member says it, since the pre-poll frame may only wait: stale is
-    /// allowed, wrong is not (Continuity).
-    pub fn turn_wait_message(&self) -> &'static str {
-        match self.agents_present {
-            Some(false) => "no agent works here",
-            _ => "waiting for the first turn",
-        }
-    }
-
-    /// The membership mirror itself: `None` until a sample observes it. The UI reads only
-    /// [`Self::turn_wait_message`], which paints `None` and `Some(true)` alike; this exposes the
-    /// held-versus-empty distinction underneath, which the turn-tracking tests assert directly.
-    pub fn agents_present(&self) -> Option<bool> {
-        self.agents_present
-    }
-
-    /// Follow the worker's baseline. Every completion carries the authoritative value, so
-    /// the mirror syncs even when the completion's snapshot is superseded or discarded.
-    pub fn sync_turn_baseline(&mut self, baseline: Option<String>) {
-        self.turn_baseline = baseline;
-    }
-
-    /// Follow what a sample saw. `None` is a sample that could not observe the whole worktree —
-    /// herdr was unreachable, or a member's directory would not resolve — and so saw nothing,
-    /// which holds the previous answer rather than replacing it. Like
-    /// [`Self::sync_turn_baseline`], this lands even from a superseded completion — the
-    /// worker is serial, so no completion can carry membership newer than a later one.
-    pub fn sync_agents_present(&mut self, present: Option<bool>) {
-        self.agents_present = present.or(self.agents_present);
-    }
-
     /// Queue a world refresh for the event loop to dispatch after the frame paints.
     /// `sample` rides the poll's status sample along; `reveal` re-reveals the cursor when
     /// the result lands, for user-initiated switches only.
-    pub fn request_world_refresh(&mut self, sample_turn: bool, reveal: bool) {
+    pub fn request_world_refresh(&mut self, reveal: bool) {
         let request = self.world_request.get_or_insert(crate::world::WorldRequest::default());
-        request.sample_turn |= sample_turn;
         request.reveal |= reveal;
     }
 
@@ -2240,7 +2231,7 @@ impl App {
                 entry.annotation = self.changed.get(&entry.path).cloned();
             }
             self.rebuild_file_rows();
-            self.request_world_refresh(false, false);
+            self.request_world_refresh(false);
         }
         Ok(())
     }
@@ -2282,7 +2273,7 @@ impl App {
         // visit paints its stash instantly and refreshes behind it. The visited marker,
         // not emptiness — a clean repo's `Changes` tab is legitimately empty.
         if self.tab_visited {
-            self.request_world_refresh(false, true);
+            self.request_world_refresh(true);
         } else {
             self.reload()?;
         }
@@ -2521,6 +2512,7 @@ impl App {
         std::mem::swap(&mut self.visible, &mut self.stash.visible);
         std::mem::swap(&mut self.expanded_folds, &mut self.stash.expanded_folds);
         std::mem::swap(&mut self.diff_path, &mut self.stash.diff_path);
+        std::mem::swap(&mut self.diff_group, &mut self.stash.diff_group);
         std::mem::swap(&mut self.diff_cursor, &mut self.stash.diff_cursor);
         std::mem::swap(&mut self.diff_scroll, &mut self.stash.diff_scroll);
         std::mem::swap(&mut self.h_scroll, &mut self.stash.h_scroll);
@@ -2548,15 +2540,17 @@ impl App {
     }
 
     /// Move the cursor in the focused pane by `delta` rows. In the files pane the cursor steps
-    /// over the tree's visible rows; landing on a file row opens its diff, while a directory row
-    /// keeps the current diff so scanning the tree never blanks the pane. The page/half-page keys
-    /// reuse this with a larger `delta`, since paging is just a bigger cursor move in the focus.
+    /// over selectable tree rows, skipping section headers; landing on a file row opens its diff,
+    /// while a directory row keeps the current diff so scanning the tree never blanks the pane.
+    /// The page/half-page keys reuse this with a larger `delta`, since paging is just a bigger
+    /// cursor move in the focus.
     pub fn move_cursor(&mut self, delta: isize) -> Result<()> {
         self.ensure_config_ready()?;
         match self.focus {
             Focus::Files => {
                 if !self.file_rows.is_empty() {
-                    self.file_cursor = step(self.file_cursor, delta, self.file_rows.len());
+                    let target = step(self.file_cursor, delta, self.file_rows.len());
+                    self.file_cursor = self.selectable_row_at(target, delta >= 0);
                     self.open_cursor_file();
                     // Reveal even when the index clamps unchanged (e.g. `k` at the top), so a
                     // navigation always pulls the cursor back after a wheel scroll.
@@ -2584,9 +2578,11 @@ impl App {
     /// Open the diff for the file under the cursor when it differs from the one shown; a
     /// no-op on a directory row, so the current diff stays put.
     fn open_cursor_file(&mut self) {
-        if let Some(i) = self.file_under_cursor_index()
-            && Some(self.entries[i].path.as_str()) != self.diff_path.as_deref()
-        {
+        let same = self.file_under_cursor_index().is_some_and(|index| {
+            Some(self.entries[index].path.as_str()) == self.diff_path.as_deref()
+                && self.entries[index].group == self.diff_group
+        });
+        if !same {
             self.reset_diff_view();
             self.load_read();
         }
@@ -2649,15 +2645,19 @@ impl App {
             // a held key stops at the file boundary. With no file to cross to — the changeset's
             // end — nothing is offered and the press is inert.
             if let Some(row) = self.cross_target(forward)
-                && let Some(path) = self.path_of_row(row)
+                && let Some(index) = self.file_rows[row].file_index()
             {
-                self.armed_cross = Some(ArmedCross { forward, path });
+                let entry = &self.entries[index];
+                self.armed_cross =
+                    Some(ArmedCross { forward, path: entry.path.clone(), group: entry.group });
             }
             return;
         };
         // The armed file is normally still there, since a poll that changes the open diff
         // disarms. A poll that dropped the armed file alone leaves the crossing to re-resolve.
-        let Some(row) = self.file_row_of_path(&armed.path).or_else(|| self.cross_target(forward))
+        let Some(row) = self
+            .file_row_of_identity(&armed.path, armed.group)
+            .or_else(|| self.cross_target(forward))
         else {
             return;
         };
@@ -2695,7 +2695,8 @@ impl App {
             {
                 continue;
             }
-            let (old, new) = self.content_sides(&entry.path, entry.previous_path.as_deref());
+            let (old, new) =
+                self.content_sides(&entry.path, entry.previous_path.as_deref(), entry.group);
             let diff =
                 self.cache.get(entry.path, entry.previous_path, &old, &new, &self.highlighter);
             if hunk_row(&diff.rows, None, forward).is_some() {
@@ -2703,12 +2704,6 @@ impl App {
             }
         }
         None
-    }
-
-    /// The path of the file at visible row `row`; `None` on a directory row.
-    fn path_of_row(&self, row: usize) -> Option<String> {
-        let i = self.file_rows.get(row)?.file_index()?;
-        Some(self.entries[i].path.clone())
     }
 
     /// The direction of the crossing the footer is offering, if a hunk step armed one.
@@ -2749,7 +2744,7 @@ impl App {
     /// Whether the traversal keys act at all: a live selection holds the cursor still, since a
     /// jump would silently drop the selection under it.
     fn can_traverse(&self) -> bool {
-        self.plugin_config().is_some() && self.select_anchor.is_none()
+        self.app_config().is_some() && self.select_anchor.is_none()
     }
 
     /// The open file's row, the origin of every traversal the diff drives. Falls back to the
@@ -2758,7 +2753,33 @@ impl App {
     fn open_file_row(&self) -> usize {
         self.diff_path
             .as_deref()
-            .and_then(|path| self.file_row_of_path(path))
+            .and_then(|path| self.file_row_of_identity(path, self.diff_group))
+            .unwrap_or(self.file_cursor)
+    }
+
+    /// Resolve a raw navigation target to a selectable row. Group headers are paint-only:
+    /// moving toward one crosses it, while clamping against the first header stays on the first
+    /// selectable row.
+    fn selectable_row_at(&self, target: usize, forward: bool) -> usize {
+        let selectable = |i: usize| {
+            !matches!(self.file_rows.get(i).map(|row| &row.kind), Some(RowKind::Group { .. }))
+        };
+        if selectable(target) {
+            return target;
+        }
+        let onward = if forward {
+            (target + 1..self.file_rows.len()).find(|&i| selectable(i))
+        } else {
+            (0..target).rev().find(|&i| selectable(i))
+        };
+        onward
+            .or_else(|| {
+                if forward {
+                    (0..target).rev().find(|&i| selectable(i))
+                } else {
+                    (target + 1..self.file_rows.len()).find(|&i| selectable(i))
+                }
+            })
             .unwrap_or(self.file_cursor)
     }
 
@@ -2775,10 +2796,13 @@ impl App {
     }
 
     /// Act on the file-list row at `index` (a mouse click): a file opens its diff, a
-    /// directory toggles its expansion.
+    /// directory toggles its expansion, and a section header is inert.
     pub fn select_file(&mut self, index: usize) -> Result<()> {
         self.ensure_config_ready()?;
         if index >= self.file_rows.len() {
+            return Ok(());
+        }
+        if matches!(self.file_rows[index].kind, RowKind::Group { .. }) {
             return Ok(());
         }
         self.focus = Focus::Files;
@@ -2787,6 +2811,34 @@ impl App {
         match self.file_rows[index].kind {
             RowKind::File { .. } => self.open_cursor_file(),
             RowKind::Dir { .. } => self.toggle_dir(),
+            RowKind::Group { .. } => unreachable!("group rows return above"),
+        }
+        Ok(())
+    }
+
+    /// Move the selected uncommitted path between the worktree and index sections.
+    pub fn toggle_stage(&mut self) -> Result<()> {
+        self.ensure_config_ready()?;
+        let Some(entry) = self.current_entry() else { return Ok(()) };
+        let path = entry.path.clone();
+        let previous_path = entry.previous_path.clone();
+        let result = match entry.group {
+            Some(ListGroup::Working) => {
+                git::stage_with_previous(&self.repo, &path, previous_path.as_deref())
+                    .map(|()| "staged")
+            }
+            Some(ListGroup::Staged) => {
+                git::unstage_with_previous(&self.repo, &path, previous_path.as_deref())
+                    .map(|()| "unstaged")
+            }
+            None => return Ok(()),
+        };
+        match result {
+            Ok(action) => {
+                self.status = format!("{action} {path}");
+                self.request_world_refresh(true);
+            }
+            Err(error) => self.status = error.to_string(),
         }
         Ok(())
     }
@@ -2834,7 +2886,7 @@ impl App {
 
     /// Expand the directory under the cursor (`→`); a no-op if it is a file or already open.
     pub fn expand_dir(&mut self) {
-        if self.plugin_config().is_none() {
+        if self.app_config().is_none() {
             return;
         }
         if let Some(path) = self.dir_under_cursor()
@@ -2846,7 +2898,7 @@ impl App {
 
     /// Collapse the directory under the cursor (`←`); a no-op if it is a file or already shut.
     pub fn collapse_dir(&mut self) {
-        if self.plugin_config().is_none() {
+        if self.app_config().is_none() {
             return;
         }
         if let Some(path) = self.dir_under_cursor()
@@ -3247,7 +3299,7 @@ impl App {
             self.reset_diff_view();
             // Open it in the active tab's view — the File view on `All files`, not a diff — so
             // the pane and the comment's anchor kind stay consistent with the tab.
-            self.open_path_in_tab(e.path, e.previous_path);
+            self.open_path_in_tab(e.path, e.previous_path, e.group);
             if let Some(fi) = self.file_row_of_path(&file) {
                 self.file_cursor = fi;
             }
@@ -3293,7 +3345,7 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick => None,
+            Mode::Normal | Mode::List | Mode::ConfirmSend | Mode::CommitPick => None,
         }
     }
 
@@ -3599,7 +3651,7 @@ impl App {
             }
             Mode::Normal
             | Mode::List
-            | Mode::Picker
+            | Mode::ConfirmSend
             | Mode::BasePick
             | Mode::CommitPick
             | Mode::Search
@@ -4104,8 +4156,8 @@ impl App {
                 out.push((A::DeleteComment, Do));
                 return out;
             }
-            Mode::Picker => {
-                return vec![(A::PickAgent, Primary), (A::ClosePicker, Do), (A::MovePickerRow, Do)];
+            Mode::ConfirmSend => {
+                return vec![(A::ConfirmSend, Primary), (A::Cancel, Do)];
             }
             Mode::BasePick => {
                 return vec![(A::PickBaseRow, Primary), (A::ClosePicker, Do), (A::MoveBaseRow, Do)];
@@ -4201,7 +4253,7 @@ impl App {
             out.push((A::Refresh, Do));
         } else if self.commits_gone() && self.tab == Tab::Changes {
             // A gone pick: the picker is the way forward, and `g` would reopen it too, so
-            // only the other three scopes offer. `All files` keeps its
+            // only the other two scopes offer. `All files` keeps its
             // content and its own actions.
             out.push((A::CommitPick, Primary));
             out.push((A::ScopeOther, Do));
@@ -4222,6 +4274,11 @@ impl App {
             }
             // The files pane's calm row 1 has the room for the hide key.
             out.push((A::NavigatorHide, Do));
+            if self.scope == Scope::Uncommitted
+                && self.current_entry().is_some_and(|entry| entry.group.is_some())
+            {
+                out.push((A::ToggleStage, Do));
+            }
         } else if self.visible.is_empty() {
             if self.navigator_hidden_here() {
                 // The hidden empty read pane: the way back leads row 1.
@@ -4341,79 +4398,35 @@ impl App {
     }
 }
 
-/// The row the picker's highlight opens on: the agent this session sent to last, else the
-/// first row. The last-sent agent counts only while it is still a candidate, so a closed
-/// pane falls through.
-fn armed_row(rows: &[AgentChoice], last_sent: Option<&str>) -> usize {
-    last_sent.and_then(|pane| rows.iter().position(|row| row.pane_id == pane)).unwrap_or(0)
-}
-
 impl App {
-    /// `Send`: one agent goes straight out, several open the picker, none refuses and names
-    /// the clipboard. The empty-store refusal is repeated here, ahead
-    /// of [`Self::export`]'s own, so `Send` with nothing written shells out to no herdr call
-    /// and opens no picker.
-    pub fn send_to_agent(&mut self) {
+    /// Open the explicit boundary between an in-app review and stdout delivery.
+    pub fn begin_send(&mut self) {
         if self.store.is_empty() {
             self.status = "no comments to send".to_string();
             return;
         }
-        match herdr::send_target() {
-            Ok(SendTarget::One(agent)) => self.export_to_agent(&agent),
-            Ok(SendTarget::Many(rows)) => self.open_picker(rows),
-            // The refusal is already a whole sentence naming the cause and the clipboard, so a
-            // prefix would only spend the width the footer needs to show it.
-            Err(e) => self.status = e.to_string(),
-        }
-    }
-
-    /// Open the picker over `rows`, arming the highlight on the agent this session sent to
-    /// last when it is still a candidate, else the first row.
-    pub fn open_picker(&mut self, rows: Vec<AgentChoice>) {
-        // A picker with no rows has nothing to choose and no `enter` that acts, and a second open
-        // over a live one would capture `Picker` as the mode to restore — either way a modal that
-        // swallows every key and that one `esc` cannot leave. The frozen row set also outranks a
-        // later one: it is what the reviewer is reading.
-        if rows.is_empty() || self.mode == Mode::Picker {
+        if self.mode == Mode::ConfirmSend {
             return;
         }
-        self.picker_cursor = armed_row(&rows, self.last_sent_pane.as_deref());
-        self.picker_rows = rows;
-        self.picker_over = self.mode.clone();
-        self.mode = Mode::Picker;
+        self.send_over = self.mode.clone();
+        self.mode = Mode::ConfirmSend;
     }
 
-    /// Close the picker back onto the view it opened over, so a reviewer who sent from the
-    /// comments list or with the find band open is not dropped into `Normal`.
-    pub fn close_picker(&mut self) {
-        if self.mode == Mode::Picker {
-            self.mode = std::mem::replace(&mut self.picker_over, Mode::Normal);
-        }
-        self.picker_rows.clear();
-        self.picker_cursor = 0;
-    }
-
-    pub fn picker_move(&mut self, delta: isize) {
-        if self.mode == Mode::Picker && !self.picker_rows.is_empty() {
-            self.picker_cursor = step(self.picker_cursor, delta, self.picker_rows.len());
+    pub fn cancel_send(&mut self) {
+        if self.mode == Mode::ConfirmSend {
+            self.mode = std::mem::replace(&mut self.send_over, Mode::Normal);
         }
     }
 
-    /// Move the highlight to `row`, for a digit key or a click. A row past the end is inert
-    /// rather than clamped, so a mistyped digit never arms a neighbour.
-    pub fn picker_goto(&mut self, row: usize) {
-        if self.mode == Mode::Picker && row < self.picker_rows.len() {
-            self.picker_cursor = row;
+    /// Freeze the formatted batch for `run` to emit only after the terminal is restored.
+    pub fn confirm_send(&mut self) {
+        if self.mode != Mode::ConfirmSend || self.store.is_empty() {
+            return;
         }
-    }
-
-    /// Send every comment to the highlighted agent, then close whatever the outcome. A
-    /// failure reports and keeps the comments, so the reviewer can reopen a fresh picker
-    /// rather than retry against a frozen row.
-    pub fn picker_pick(&mut self) {
-        let Some(agent) = self.picker_rows.get(self.picker_cursor).cloned() else { return };
-        self.close_picker();
-        self.export_to_agent(&agent);
+        let comments: Vec<&Comment> = self.store.iter().collect();
+        self.send_output = Some(format_all(&comments));
+        self.store.take_all();
+        self.should_quit = true;
     }
 
     /// Whether the base picker can open here: a file tab and no `--base` flag, whatever the
@@ -4707,17 +4720,6 @@ impl App {
         self.commit_picker = Some(fresh);
     }
 
-    /// Export to one decided pane. Nothing re-resolves it, so a pane that closed while the
-    /// picker was open fails here and keeps every comment. Only a
-    /// delivery arms the next picker's highlight, and the pane comes from the row this send
-    /// addressed, so `last used` can never name a pane the export did not reach.
-    fn export_to_agent(&mut self, agent: &AgentChoice) {
-        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
-        if self.export(&target) {
-            self.last_sent_pane = Some(agent.pane_id.clone());
-        }
-    }
-
     /// Send/copy every written comment to `target`; consume the whole set only on
     /// success. A failed export leaves all comments in place.
     /// Reports whether the comments were delivered.
@@ -5001,21 +5003,6 @@ mod tests {
     }
 
     #[test]
-    fn config_recovery_carries_the_last_sent_agent() {
-        // The `last used` arming is session memory: a config error between two sends must
-        // not move the next picker's default.
-        let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
-        old.last_sent_pane = Some("w8:p2".to_string());
-        old.mode = Mode::Picker;
-
-        let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
-        recovered.carry_authored_state_from(&mut old);
-        assert_eq!(recovered.last_sent_pane.as_deref(), Some("w8:p2"));
-        // A picker that was open when the config broke does not come back with it.
-        assert_eq!(recovered.mode, Mode::Normal);
-    }
-
-    #[test]
     fn config_recovery_carries_the_base_picker_whole() {
         // The base picker survives recovery with its rows, filter, and highlight
         let mut old = App::blocked(PathBuf::from("."), Scope::Branch, None);
@@ -5171,11 +5158,10 @@ mod tests {
         // are what make the recovered app dispatch that refresh instead of keeping the
         // stale stashed frame until the next poll.
         let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
-        old.request_world_refresh(true, true);
+        old.request_world_refresh(true);
         let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
         recovered.carry_authored_state_from(&mut old);
         let request = recovered.world_request.expect("the pending refresh survives the swap");
-        assert!(request.sample_turn, "the poll's sample flag survives the recovery swap");
         assert!(request.reveal, "the switch's reveal flag survives the recovery swap");
     }
 
@@ -5188,9 +5174,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "navigator_position = \"left\"\n").unwrap();
-        let config = crate::config::plugin_config_in(dir.path()).unwrap();
+        let config = crate::config::app_config_in(dir.path()).unwrap();
         let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
-        recovered.set_plugin_config(config);
+        recovered.set_app_config(config);
         recovered.carry_authored_state_from(&mut old);
 
         assert_eq!(recovered.navigator_position, NavigatorPosition::Left);
@@ -5235,6 +5221,7 @@ mod tests {
             annotation: None,
             ignored: false,
             is_dir: false,
+            group: None,
         });
         app.entries.push(crate::file_list::Entry {
             path: "src/other.rs".into(),
@@ -5242,6 +5229,7 @@ mod tests {
             annotation: None,
             ignored: false,
             is_dir: false,
+            group: None,
         });
         app.file_rows = vec![
             ListRow {
@@ -5360,7 +5348,7 @@ mod tests {
             ("the search screen", Box::new(|a: &mut App| a.mode = Mode::Search), None),
             ("the `PR` tab", Box::new(|a: &mut App| a.tab = Tab::Pr), None),
             ("the find band", Box::new(|a: &mut App| a.mode = Mode::Find), None),
-            ("the agent picker", Box::new(|a: &mut App| a.mode = Mode::Picker), None),
+            ("send confirmation", Box::new(|a: &mut App| a.mode = Mode::ConfirmSend), None),
             ("the base picker", Box::new(|a: &mut App| a.mode = Mode::BasePick), None),
         ];
 

@@ -1036,7 +1036,7 @@ mod tests {
         let (hl, p) = setup();
         // One-word link followed by its dim destination, and a two-word link whose
         // interior space stays part of the underlined run.
-        for md in ["built for [herdr](https://herdr.dev).", "see [the run](https://ci.example/1)"] {
+        for md in ["built for [Diple](https://Diple.dev).", "see [the run](https://ci.example/1)"] {
             let lines = render_lines(md, 80, &hl, &p);
             for span in &lines[0].spans {
                 if span.style.add_modifier.contains(Modifier::UNDERLINED) {

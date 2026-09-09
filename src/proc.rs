@@ -47,7 +47,7 @@ fn resolve_on(path: &OsStr, name: &OsStr) -> Option<PathBuf> {
 /// Resolve `program` on the host PATH — the common host bins first, the inherited PATH after —
 /// and give the child that same PATH.
 ///
-/// For the tools reviewr runs for itself. [`user_command`] is the other way round, for the
+/// For the tools Diple runs for itself. [`user_command`] is the other way round, for the
 /// reviewer's own.
 pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
     let program = program.as_ref();

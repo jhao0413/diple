@@ -1,7 +1,7 @@
 name: release
 
 # Build prebuilt binaries for each supported platform and attach them to the GitHub Release
-# whenever a v* tag is pushed. herdr/install.sh downloads the matching asset on plugin install.
+# whenever a v* tag is pushed.
 on:
   push:
     tags: ["v*"]
@@ -9,7 +9,7 @@ on:
 permissions:
   contents: write
   # Sigstore-signed build provenance for every release asset, verifiable by anyone via
-  # `gh attestation verify <asset> --repo persiyanov/herdr-reviewr`.
+  # `gh attestation verify <asset> --repo jhao0413/diple`.
   id-token: write
   attestations: write
 
@@ -29,7 +29,7 @@ jobs:
       - uses: taiki-e/create-gh-release-action@v1
         with:
           changelog: CHANGELOG.md
-          title: herdr-reviewr $version
+          title: Diple $version
           draft: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -48,12 +48,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Builds herdr-reviewr for the target (cross-compiling aarch64 Linux via `cross` as needed),
-      # archives it as herdr-reviewr-<target>.tar.gz with a .sha256 sidecar, and uploads both to
+      # Builds Diple for the target (cross-compiling aarch64 Linux via `cross` as needed),
+      # archives it as diple-<target>.tar.gz with a .sha256 sidecar, and uploads both to
       # the release for this tag. The toolchain is pinned by rust-toolchain.toml.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: herdr-reviewr
+          bin: diple
           target: ${{ matrix.target }}
           archive: $bin-$target
           checksum: sha256
@@ -62,7 +62,7 @@ jobs:
       # The archive the step above built and uploaded gets a signed provenance attestation.
       - uses: actions/attest-build-provenance@v4
         with:
-          subject-path: herdr-reviewr-${{ matrix.target }}.tar.gz
+          subject-path: diple-${{ matrix.target }}.tar.gz
 
   # Publish once every target's assets are attached. Publishing seals an immutable release,
   # so this runs last; a failed target leaves the draft for inspection instead of shipping a

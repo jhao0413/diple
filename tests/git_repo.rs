@@ -6,13 +6,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::Repo;
-use herdr_reviewr::git::{
-    ResolvedBase, abbreviate_oid, all_files, changed_against_tree,
-    changed_files as changed_files_oid, default_branch_name, file_content, list_branches,
-    merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base, resolve_commit,
-    snapshot_worktree, write_base_pick, write_baseline_ref,
+use diple::git::{
+    ResolvedBase, abbreviate_oid, all_files, changed_files as changed_files_oid,
+    default_branch_name, file_content, index_content, list_branches, merge_base as merge_base_oid,
+    read_base_pick, resolve_base, resolve_commit, stage, status_codes, unstage, write_base_pick,
 };
-use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
+use diple::model::{ChangeKind, ChangedFile, Scope};
 
 fn by_path(files: &[ChangedFile]) -> HashMap<&str, &ChangedFile> {
     files.iter().map(|f| (f.path.as_str(), f)).collect()
@@ -24,7 +23,7 @@ fn changed_files(
     base: Option<&str>,
 ) -> anyhow::Result<Vec<ChangedFile>> {
     let winner = resolve_base(repo, base).map_err(|e| anyhow::anyhow!("{}", e.0))?.status.winner;
-    changed_files_oid(repo, scope, winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid))
+    changed_files_oid(repo, scope, winner.as_ref().map(diple::git::ResolvedBase::oid))
 }
 
 fn merge_base(repo: &Path, base: Option<&str>) -> Option<String> {
@@ -275,15 +274,8 @@ fn the_pick_persists_in_a_private_worktree_ref() {
     write_base_pick(r.path(), "release/1.0").unwrap();
     assert_eq!(read_base_pick(r.path()).unwrap().as_deref(), Some("release/1.0"));
 
-    let reviewr_before = ref_names(r.path(), "refs/reviewr");
     write_base_pick(r.path(), "dev").unwrap();
-    let tree = snapshot_worktree(r.path()).unwrap();
-    write_baseline_ref(r.path(), &tree).unwrap();
-    assert_eq!(
-        ref_names(r.path(), "refs/worktree/reviewr"),
-        ["refs/worktree/reviewr/base-pick", "refs/worktree/reviewr/turn-base"]
-    );
-    assert_eq!(ref_names(r.path(), "refs/reviewr"), reviewr_before);
+    assert_eq!(ref_names(r.path(), "refs/worktree/diple"), ["refs/worktree/diple/base-pick"]);
     assert_eq!(r.git(&["status", "--porcelain"]).trim(), "");
 }
 
@@ -423,7 +415,7 @@ fn a_missing_head_tilde_pick_is_skipped_and_reactivates() {
     write_base_pick(r.path(), "HEAD~1").unwrap();
 
     let status = resolve_base(r.path(), None).unwrap().status;
-    assert_eq!(status.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name), Some("main"));
+    assert_eq!(status.winner.as_ref().map(diple::git::ResolvedBase::name), Some("main"));
     assert_eq!(status.skipped.as_deref(), Some("HEAD~1"));
 
     r.write("base.rs", "2\n");
@@ -566,12 +558,6 @@ fn ignored_paths_never_enter_changes() {
         "uncommitted"
     );
     assert!(!has_ignored(&changed_files(r.path(), Scope::Branch, Some("main")).unwrap()), "branch");
-
-    // last-turn: even an ignored file that changes within the turn stays out, because the
-    // baseline snapshot and the live snapshot both honor .gitignore.
-    let base = snapshot_worktree(r.path()).unwrap();
-    r.write("ignored/note.md", "scratch v2\n");
-    assert!(!has_ignored(&changed_against_tree(r.path(), &base).unwrap()), "last-turn");
 }
 
 #[test]
@@ -699,107 +685,42 @@ fn git_access_never_mutates_the_repo() {
     assert_eq!(status_before, r.git(&["status", "--porcelain"]), "working tree unchanged");
 }
 
-// --- turn baseline (last-turn scope) -------------------------------------------
-
 #[test]
-fn changed_against_tree_shows_edits_creates_and_deletes_since_the_snapshot() {
+fn a_partially_staged_file_carries_separate_status_and_stats() {
     let r = Repo::init();
-    r.write("tracked.rs", "one\ntwo\n");
-    r.write("doomed.rs", "bye\n");
+    r.write("a.rs", "one\n");
     r.commit_all("init");
-    r.write("idle_untracked.rs", "u\n"); // untracked already at snapshot time
+    r.write("a.rs", "one\nstaged\n");
+    stage(r.path(), "a.rs").unwrap();
+    r.write("a.rs", "one\nstaged\nworking\n");
 
-    let base = snapshot_worktree(r.path()).unwrap();
-
-    // The turn: edit a tracked file, create a new file, delete one, and leave the
-    // pre-existing untracked file untouched.
-    r.write("tracked.rs", "one\nTWO\nthree\n");
-    r.write("created.rs", "new\n");
-    r.remove("doomed.rs");
-
-    let files = changed_against_tree(r.path(), &base).unwrap();
-    let files = by_path(&files);
-    assert_eq!(files["tracked.rs"].kind, ChangeKind::Modified);
-    assert_eq!(files["created.rs"].kind, ChangeKind::Added);
-    assert_eq!(files["doomed.rs"].kind, ChangeKind::Deleted);
-    assert!(
-        !files.contains_key("idle_untracked.rs"),
-        "an untracked file unchanged across the turn is not a phantom delete"
-    );
+    let files = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let file = by_path(&files)["a.rs"];
+    let status = file.status_code.expect("uncommitted status");
+    assert_eq!((status.staged, status.unstaged), (Some('M'), Some('M')));
+    let side_counts = file.stage_stats.expect("per-side stats");
+    assert_eq!(side_counts.staged, (1, 0));
+    assert_eq!(side_counts.unstaged, (1, 0));
+    assert_eq!(index_content(r.path(), "a.rs"), "one\nstaged\n");
 }
 
 #[test]
-fn changed_against_tree_sees_an_untracked_only_turn() {
-    // A turn whose only act is creating a new file must register as a change — the
-    // promotion path depends on this being a real diff.
+fn stage_and_unstage_change_only_the_index() {
     let r = Repo::init();
-    r.write("a.rs", "a\n");
+    r.write("a.rs", "one\n");
     r.commit_all("init");
-    let base = snapshot_worktree(r.path()).unwrap();
-    r.write("fresh.rs", "x\n");
-    let files = changed_against_tree(r.path(), &base).unwrap();
-    assert_eq!(by_path(&files)["fresh.rs"].kind, ChangeKind::Added);
-}
+    r.write("a.rs", "one\ntwo\n");
+    let worktree = std::fs::read_to_string(r.path().join("a.rs")).unwrap();
 
-#[test]
-fn snapshot_worktree_never_mutates_the_repo() {
-    let r = Repo::init();
-    r.write("a.rs", "x\n");
-    r.commit_all("init");
-    r.write("a.rs", "y\n");
-    r.write("untracked.rs", "u\n");
+    stage(r.path(), "a.rs").unwrap();
+    assert_eq!(index_content(r.path(), "a.rs"), worktree);
+    assert_eq!(std::fs::read_to_string(r.path().join("a.rs")).unwrap(), worktree);
+    assert_eq!(status_codes(r.path())["a.rs"].staged, Some('M'));
 
-    let git_dir = r.git(&["rev-parse", "--absolute-git-dir"]);
-    let git_dir = std::path::Path::new(git_dir.trim());
-    // The index's logical content (entries, not the racy stat cache `git status` rewrites).
-    let staged_before = r.git(&["ls-files", "--stage"]);
-    let status_before = r.git(&["status", "--porcelain"]);
-    let head_before = r.git(&["rev-parse", "HEAD"]);
-    let branches_before = r.git(&["branch", "-a"]);
-
-    let tree = snapshot_worktree(r.path()).unwrap();
-    assert_eq!(tree.len(), 40, "a tree object id");
-
-    assert_eq!(r.git(&["ls-files", "--stage"]), staged_before, "real index entries untouched");
-    assert_eq!(r.git(&["status", "--porcelain"]), status_before, "working tree status unchanged");
-    assert_eq!(r.git(&["rev-parse", "HEAD"]), head_before, "HEAD unchanged");
-    assert_eq!(r.git(&["branch", "-a"]), branches_before, "no branch created");
-    assert!(!git_dir.join("reviewr-turn-index").exists(), "the temp index is cleaned up");
-}
-
-#[test]
-fn snapshot_worktree_recovers_from_a_stale_index_lock() {
-    let r = Repo::init();
-    r.write("a.rs", "x\n");
-    r.commit_all("init");
-
-    let git_dir = r.git(&["rev-parse", "--absolute-git-dir"]);
-    let git_dir = std::path::Path::new(git_dir.trim());
-    // A hard crash mid-`add` leaves git's lock on the temp index behind; a later snapshot
-    // must clear it instead of failing "Unable to create ... File exists" forever after.
-    std::fs::write(git_dir.join("reviewr-turn-index.lock"), "").unwrap();
-
-    let tree = snapshot_worktree(r.path()).unwrap();
-    assert_eq!(tree.len(), 40, "a tree object id");
-    assert!(!git_dir.join("reviewr-turn-index.lock").exists(), "the stale lock is cleared");
-}
-
-#[test]
-fn baseline_ref_round_trips_under_the_private_namespace() {
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    assert!(read_baseline_ref(r.path()).is_none(), "no baseline initially");
-
-    let tree = snapshot_worktree(r.path()).unwrap();
-    write_baseline_ref(r.path(), &tree).unwrap();
-    assert_eq!(read_baseline_ref(r.path()).as_deref(), Some(tree.as_str()));
-
-    assert!(!r.git(&["branch", "-a"]).contains("reviewr"), "the baseline is not a branch");
-    assert!(
-        r.git(&["show-ref"]).contains("refs/worktree/reviewr/turn-base"),
-        "the baseline lives under the private worktree namespace"
-    );
+    unstage(r.path(), "a.rs").unwrap();
+    assert_eq!(index_content(r.path(), "a.rs"), "one\n");
+    assert_eq!(std::fs::read_to_string(r.path().join("a.rs")).unwrap(), worktree);
+    assert_eq!(status_codes(r.path())["a.rs"].unstaged, Some('M'));
 }
 
 #[test]
@@ -822,48 +743,6 @@ fn a_pick_in_one_worktree_is_invisible_in_its_sibling() {
     write_base_pick(linked.path(), "feature").unwrap();
     assert_eq!(read_base_pick(other.path()).unwrap(), None, "linked → linked");
     assert_eq!(read_base_pick(linked.path()).unwrap().as_deref(), Some("feature"));
-}
-
-#[test]
-fn a_turn_baseline_in_one_worktree_is_invisible_in_its_sibling() {
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    let linked = r.add_worktree("feature");
-    let tree = snapshot_worktree(r.path()).unwrap();
-
-    write_baseline_ref(r.path(), &tree).unwrap();
-    assert_eq!(read_baseline_ref(r.path()).as_deref(), Some(tree.as_str()));
-    assert_eq!(read_baseline_ref(linked.path()), None, "main → linked");
-
-    write_baseline_ref(linked.path(), &tree).unwrap();
-    assert_eq!(read_baseline_ref(linked.path()).as_deref(), Some(tree.as_str()));
-    let other = r.add_worktree("other");
-    assert_eq!(read_baseline_ref(other.path()), None, "linked → linked");
-}
-
-#[test]
-fn a_planted_shared_pick_is_not_this_worktrees_pick() {
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    r.set_origin_default("main", "main");
-    let linked = r.add_worktree("feature");
-    r.plant_legacy_base_pick("dev");
-
-    assert_eq!(read_base_pick(linked.path()).unwrap(), None);
-    let status = resolve_base(linked.path(), None).unwrap().status;
-    assert_eq!(status.winner.as_ref().map(ResolvedBase::name), Some("main"));
-}
-
-#[test]
-fn a_planted_hash_baseline_is_not_this_worktrees_last_turn() {
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    let tree = snapshot_worktree(r.path()).unwrap();
-    r.plant_legacy_turn_base(&tree);
-    assert_eq!(read_baseline_ref(r.path()), None);
 }
 
 #[test]
@@ -896,7 +775,7 @@ fn all_files_lists_tracked_untracked_and_ignored_dirs_collapsed() {
 
 #[test]
 fn list_ignored_dir_returns_immediate_children_only() {
-    use herdr_reviewr::git::list_ignored_dir;
+    use diple::git::list_ignored_dir;
     let r = Repo::init();
     r.write(".gitignore", "target/\n");
     r.write("target/build.o", "x\n");
@@ -932,7 +811,7 @@ fn run_repo() -> (Repo, Vec<String>) {
 
 #[test]
 fn a_run_of_three_diffs_its_oldest_parent_against_its_newest() {
-    use herdr_reviewr::git::{changed_between, parent_or_empty};
+    use diple::git::{changed_between, parent_or_empty};
     let (r, shas) = run_repo();
     // A dirty worktree and an untracked file stay out: both sides come from commits.
     r.write("root.rs", "dirty\n");
@@ -956,7 +835,7 @@ fn a_run_of_three_diffs_its_oldest_parent_against_its_newest() {
 
 #[test]
 fn a_root_commit_diffs_against_the_empty_tree() {
-    use herdr_reviewr::git::{EMPTY_TREE, changed_between, parent_or_empty, run_length};
+    use diple::git::{EMPTY_TREE, changed_between, parent_or_empty, run_length};
     let (r, shas) = run_repo();
     let old = parent_or_empty(r.path(), &shas[0]).unwrap();
     assert_eq!(old, EMPTY_TREE);
@@ -972,7 +851,7 @@ fn a_root_commit_diffs_against_the_empty_tree() {
 
 #[test]
 fn a_merge_commit_contributes_its_tree_change() {
-    use herdr_reviewr::git::{CommitRef, changed_between, parent_or_empty};
+    use diple::git::{CommitRef, changed_between, parent_or_empty};
     let (r, shas) = run_repo();
     r.git(&["checkout", "-q", "-b", "side", &shas[1]]);
     r.write("side.rs", "s\n");
@@ -990,7 +869,7 @@ fn a_merge_commit_contributes_its_tree_change() {
     r.git(&["tag", "v1"]);
     r.git(&["branch", "other", &shas[3]]);
     r.git(&["update-ref", "refs/remotes/origin/main", &shas[2]]);
-    let rows = herdr_reviewr::git::list_commits(r.path(), None).unwrap();
+    let rows = diple::git::list_commits(r.path(), None).unwrap();
     assert!(rows[0].merge && !rows[1].merge);
     assert_eq!(rows[0].author, "Test");
     assert_eq!(rows[0].refs, [CommitRef::Tag("v1".into())], "HEAD and its branch are dropped");
@@ -1004,7 +883,7 @@ fn a_merge_commit_contributes_its_tree_change() {
 
 #[test]
 fn a_shallow_cut_is_gone_not_a_root() {
-    use herdr_reviewr::git::{EMPTY_TREE, commit_exists, parent_or_empty};
+    use diple::git::{EMPTY_TREE, commit_exists, parent_or_empty};
     let (r, shas) = run_repo();
     let shallow = tempfile::tempdir().unwrap();
     let url = format!("file://{}", r.path().display());
@@ -1026,9 +905,7 @@ fn a_shallow_cut_is_gone_not_a_root() {
 
 #[test]
 fn a_rewritten_commit_still_diffs_and_a_pruned_one_is_missing() {
-    use herdr_reviewr::git::{
-        changed_between, commit_exists, is_reachable, list_commits, parent_or_empty,
-    };
+    use diple::git::{changed_between, commit_exists, is_reachable, list_commits, parent_or_empty};
     let (r, shas) = run_repo();
     assert!(is_reachable(r.path(), &shas[2]));
     // Rewrite the tip: the old commits keep their objects but leave `HEAD`'s history.
@@ -1057,7 +934,7 @@ fn a_rewritten_commit_still_diffs_and_a_pruned_one_is_missing() {
 
 #[test]
 fn the_universe_is_the_branch_over_its_base_or_the_last_fifty() {
-    use herdr_reviewr::git::list_commits;
+    use diple::git::list_commits;
     let (r, shas) = run_repo();
     r.set_origin_default("main", &shas[1]);
     r.git(&["checkout", "-q", "-b", "feature"]);
@@ -1078,7 +955,7 @@ fn the_universe_is_the_branch_over_its_base_or_the_last_fifty() {
 
 #[test]
 fn the_commit_scope_writes_nothing() {
-    use herdr_reviewr::git::{changed_between, list_commits, parent_or_empty, run_length};
+    use diple::git::{changed_between, list_commits, parent_or_empty, run_length};
     let (r, shas) = run_repo();
     r.write("root.rs", "dirty\n");
     let before = (

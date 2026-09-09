@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Perceived-latency benchmark for herdr-reviewr.
+"""Perceived-latency benchmark for diple.
 
 Drives the real binary through a PTY and measures keypress -> first response
 byte (the UI-thread stall the user feels) and keypress -> output quiescence
@@ -7,13 +7,13 @@ byte (the UI-thread stall the user feels) and keypress -> output quiescence
 an injected key, never a poll tick.
 
 Usage:
-  scripts/bench_tui.py --binary target/release/herdr-reviewr --fixture
-  scripts/bench_tui.py --binary target/release/herdr-reviewr --repo /path/to/repo --label landing
+  scripts/bench_tui.py --binary target/release/diple --fixture
+  scripts/bench_tui.py --binary target/release/diple --repo /path/to/repo --label landing
   scripts/bench_tui.py ... --json out.json      # machine-readable results
   scripts/bench_tui.py ... --iterations 12
 
 The fixture repo is generated deterministically (same content every time) in
---fixture-dir (default: <scratch>/reviewr-bench-fixture), so numbers are
+--fixture-dir (default: <scratch>/Diple-bench-fixture), so numbers are
 comparable across sessions and machines of the same class.
 """
 
@@ -97,7 +97,7 @@ class Session:
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         env = {**os.environ, "TERM": "xterm-256color"}
-        env.pop("HERDR_PLUGIN_CONFIG_DIR", None)  # standalone mode: no plugin config reads
+        env.pop("DIPLE_CONFIG_DIR", None)  # benchmark with platform-default configuration
         self.proc = subprocess.Popen(
             [binary, repo, "--poll", "600000"],
             stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
@@ -262,7 +262,7 @@ def main():
     targets = []
     if args.fixture:
         fd = args.fixture_dir or os.path.join(
-            os.environ.get("TMPDIR", "/tmp"), "reviewr-bench-fixture"
+            os.environ.get("TMPDIR", "/tmp"), "Diple-bench-fixture"
         )
         print(f"fixture: {fd}", file=sys.stderr)
         build_fixture(fd)

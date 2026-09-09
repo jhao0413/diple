@@ -111,14 +111,14 @@ pub fn resolve(name: Option<&str>) -> Theme {
     }
 }
 
-/// Whether `name` selects a complete built-in theme. Plugin configuration validates against
+/// Whether `name` selects a complete built-in theme. Diple configuration validates against
 /// this same catalog before a snapshot is applied.
 pub fn is_known(name: &str) -> bool {
     build(name).is_some()
 }
 
-/// The built theme for `name`, or `None` when it is not a known palette. Names match herdr's
-/// so the value a user copies from their herdr config resolves to the same palette.
+/// The built theme for `name`, or `None` when it is not a known palette. Names match Diple's
+/// so the value a user copies from their Diple config resolves to the same palette.
 fn build(name: &str) -> Option<Theme> {
     use Appearance::{Dark, Light};
     use EmbeddedThemeName as E;
@@ -133,14 +133,14 @@ fn build(name: &str) -> Option<Theme> {
         "one-light" => derived("one-light", Light, E::OneHalfLight, ONE_LIGHT),
         "solarized" => derived("solarized", Dark, E::SolarizedDark, SOLARIZED),
         "solarized-light" => derived("solarized-light", Light, E::SolarizedLight, SOLARIZED_LIGHT),
-        // Popular themes beyond herdr's set, whose syntax `two-face` already provides.
+        // Popular themes beyond Diple's set, whose syntax `two-face` already provides.
         "catppuccin-frappe" => derived("catppuccin-frappe", Dark, E::CatppuccinFrappe, FRAPPE),
         "catppuccin-macchiato" => {
             derived("catppuccin-macchiato", Dark, E::CatppuccinMacchiato, MACCHIATO)
         }
         "github-light" => derived("github-light", Light, E::Github, GITHUB_LIGHT),
         "monokai" => derived("monokai", Dark, E::MonokaiExtended, MONOKAI),
-        // herdr names whose syntax `two-face` lacks, paired with a vendored `.tmTheme`.
+        // Diple names whose syntax `two-face` lacks, paired with a vendored `.tmTheme`.
         "tokyo-night" => bundled("tokyo-night", Dark, TOKYO_NIGHT_TM, TOKYO_NIGHT),
         "tokyo-night-day" => bundled("tokyo-night-day", Light, TOKYO_NIGHT_DAY_TM, TOKYO_NIGHT_DAY),
         "rose-pine" => bundled("rose-pine", Dark, ROSE_PINE_TM, ROSE_PINE),

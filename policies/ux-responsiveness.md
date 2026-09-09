@@ -2,7 +2,7 @@
 
 ## Intent
 
-reviewr runs live beside a working agent, so every action must feel instant and any unavoidable delay must be signalled — never a silent stale-then-swap. Any change that touches rendering, loading, async data, or the event loop is evaluated for perceived latency and transition quality, not just correctness.
+Diple is an interactive review workspace, so every action must feel instant and any unavoidable delay must be signalled — never a silent stale-then-swap. Any change that touches rendering, loading, async data, or the event loop is evaluated for perceived latency and transition quality, not just correctness.
 
 ## Policy
 
@@ -12,14 +12,14 @@ reviewr runs live beside a working agent, so every action must feel instant and 
 - Never paint an internally inconsistent transitional frame. The header, file list, changed-count, and diff must agree; a label must not describe content that is not on screen yet.
 - Refresh in place (a poll or `r`) keeps the current content and the cursor/scroll position — it updates without flicker, blanking, or a cursor jump.
 - When new data is not ready, keep the last content and signal the refetch rather than blanking (the `PR` tab's "keep last, signal, never blank" discipline).
-- No blocking external call (git, `gh`, the herdr CLI) runs on the event-loop or draw thread. Run it on a worker and deliver the result over a channel, so a slow or hung call never freezes input or rendering.
+- No blocking external call (git or a forge CLI) runs on the event-loop or draw thread. Run it on a worker and deliver the result over a channel, so a slow or hung call never freezes input or rendering.
 - Keep even fast interactive work off the keystroke path when it is avoidable: memoize session-fixed values and never rerun a subprocess per keystroke for something already known.
 
 ## Exceptions
 
 - A genuinely slow or hung external call (git under a busy agent, `gh`) may show a delayed loading state and, while it is outstanding, wake the loop more often to deliver promptly.
 - A large file or a first-visit diff may pay a one-time inline cost when async prefetch is not warranted; note it rather than building speculative machinery.
-- The terminal-editor handoff (`e`) blocks the event loop for the whole editor session. This is a deliberate, permanent exception: the editor owns the pane, and reviewr can neither draw nor read input while it does. A window editor is spawned and never waited on, so the pane keeps answering, and its write lands on the ordinary poll like any other change to the worktree — reviewr adds no watch, wake, or timer for it.
+- The terminal-editor handoff (`e`) blocks the event loop for the whole editor session. This is a deliberate, permanent exception: the editor owns the terminal, and Diple can neither draw nor read input while it does. A window editor is spawned and never waited on, so Diple keeps answering and observes its write on the ordinary poll.
 - Opening the base picker reads its branch list inline, measured at ~30ms. This is a deliberate, permanent exception: an async open would either flash an empty list or blank the frame, both of which this policy forbids above.
 - Opening the commit picker reads its commit list inline, the same way and for the same reason. While the picker is open, a poll that moved `HEAD` re-lists inline too, so the rows a keystroke is about to pick are never stale. A poll that left `HEAD` alone spawns nothing.
 - Checking a non-empty base-picker query that matches no row as a git revision runs after a 150ms pause, or immediately on Enter. Same class as opening the picker: the row must exist before the next keystroke can pick it.

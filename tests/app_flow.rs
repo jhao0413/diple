@@ -3,23 +3,20 @@
 
 mod common;
 
-use std::cell::RefCell;
-use std::path::Path;
-
 use anyhow::{Result, bail};
 use common::{Repo, app_on, enter_tab, typed};
-use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode};
-use herdr_reviewr::config::NavigatorPosition;
-use herdr_reviewr::export::ExportTarget;
-use herdr_reviewr::herdr::{AgentChoice, AgentSample};
-use herdr_reviewr::keymap::{Action, Key, KeyCode as BindingCode, Keymap};
-use herdr_reviewr::model::{Scope, Side};
-use herdr_reviewr::turn::Status;
-use herdr_reviewr::{handle_key, handle_mouse};
+use diple::app::{App, Band, Focus, FooterAction, Mode};
+use diple::config::NavigatorPosition;
+use diple::export::ExportTarget;
+use diple::file_list::{ListGroup, RowKind};
+use diple::keymap::{Action, Key, KeyCode as BindingCode, Keymap};
+use diple::model::{Scope, Side};
+use diple::{handle_key, handle_mouse};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use std::cell::RefCell;
 
 /// An export target that records what it was handed and can be made to fail.
 struct FakeTarget {
@@ -84,11 +81,11 @@ fn the_file_list_decouples_viewport_scroll_from_selection() {
         r.write(&format!("f{i:02}.txt"), "two\n");
     }
     let mut app = app_on(&r);
-    assert_eq!(app.file_rows.len(), 20);
+    assert_eq!(app.file_rows.len(), 21, "the section header is a visible, inert row");
     let viewport = 6;
 
     // The first file is selected and its diff is open.
-    assert_eq!(app.file_cursor, 0);
+    assert_eq!(app.file_cursor, 1);
     let opened = app.diff_path.clone();
     assert!(opened.is_some());
 
@@ -99,7 +96,7 @@ fn the_file_list_decouples_viewport_scroll_from_selection() {
     app.wheel_files(5);
     app.bound_file_scroll(viewport);
     assert_eq!(app.file_scroll, 5);
-    assert_eq!(app.file_cursor, 0);
+    assert_eq!(app.file_cursor, 1);
     assert_eq!(app.diff_path, opened);
     assert!(app.file_cursor < app.file_scroll);
     assert!(!app.reveal_files, "the wheel does not request a reveal");
@@ -107,7 +104,7 @@ fn the_file_list_decouples_viewport_scroll_from_selection() {
     // Moving the selection reveals it and opens that one file.
     app.move_cursor(1).unwrap();
     app.reveal_file_cursor(viewport);
-    assert_eq!(app.file_cursor, 1);
+    assert_eq!(app.file_cursor, 2);
     assert!(app.file_cursor >= app.file_scroll && app.file_cursor < app.file_scroll + viewport);
     assert_ne!(app.diff_path, opened);
 
@@ -116,14 +113,60 @@ fn the_file_list_decouples_viewport_scroll_from_selection() {
         app.move_cursor(1).unwrap();
     }
     app.reveal_file_cursor(viewport);
-    assert_eq!(app.file_cursor, 19);
+    assert_eq!(app.file_cursor, 20);
     assert!(app.file_cursor < app.file_scroll + viewport);
-    assert_eq!(app.file_scroll, 20 - viewport);
+    assert_eq!(app.file_scroll, 21 - viewport);
 
     // An over-scroll is bounded so the window never shows a blank tail.
     app.wheel_files(100);
     app.bound_file_scroll(viewport);
-    assert_eq!(app.file_scroll, 20 - viewport);
+    assert_eq!(app.file_scroll, 21 - viewport);
+}
+
+#[test]
+fn staged_sections_are_inert_boundaries_and_stage_actions_keep_place() {
+    let r = Repo::init();
+    r.write("same.rs", "base\n");
+    r.commit_all("init");
+    r.write("same.rs", "base\nstaged\n");
+    r.git(&["add", "same.rs"]);
+    r.write("same.rs", "base\nstaged\nworking\n");
+    let mut app = app_on(&r);
+
+    assert!(matches!(app.file_rows[0].kind, RowKind::Group { .. }));
+    assert_eq!(app.entries[app.file_rows[1].file_index().unwrap()].group, Some(ListGroup::Staged));
+    assert!(matches!(app.file_rows[2].kind, RowKind::Group { .. }));
+    assert_eq!(app.entries[app.file_rows[3].file_index().unwrap()].group, Some(ListGroup::Working));
+
+    // Line movement crosses, rather than selects, the paint-only section heading.
+    app.move_cursor(1).unwrap();
+    assert_eq!(app.file_cursor, 3);
+    assert_eq!(app.diff_group, Some(ListGroup::Working));
+    app.move_cursor(-1).unwrap();
+    assert_eq!(app.file_cursor, 1);
+    assert_eq!(app.diff_group, Some(ListGroup::Staged));
+
+    // Clicking a heading changes neither focus, selection, nor the open side.
+    app.focus = Focus::Diff;
+    app.select_file(2).unwrap();
+    assert_eq!(app.focus, Focus::Diff);
+    assert_eq!(app.file_cursor, 1);
+    assert_eq!(app.diff_group, Some(ListGroup::Staged));
+
+    // Staging the working row merges it into the staged entry; continuity falls back to the
+    // surviving identity. Unstaging performs the inverse without touching the worktree.
+    app.select_file(3).unwrap();
+    app.toggle_stage().unwrap();
+    app.reload().unwrap();
+    assert_eq!(app.diff_group, Some(ListGroup::Staged));
+    assert!(r.git(&["diff", "--", "same.rs"]).is_empty());
+    assert!(!r.git(&["diff", "--cached", "--", "same.rs"]).is_empty());
+
+    app.toggle_stage().unwrap();
+    app.reload().unwrap();
+    assert_eq!(app.diff_group, Some(ListGroup::Working));
+    assert!(r.git(&["diff", "--cached", "--", "same.rs"]).is_empty());
+    assert!(!r.git(&["diff", "--", "same.rs"]).is_empty());
 }
 
 /// A repo whose single file has `n` lines, all changed, so the diff has many visible rows.
@@ -189,13 +232,13 @@ fn a_boundary_move_reveals_the_cursor_after_wheeling() {
     let vp = 6;
     app.wheel_files(10);
     app.bound_file_scroll(vp);
-    assert!(app.file_cursor < app.file_scroll, "cursor (row 0) is wheeled off-screen above");
+    assert!(app.file_cursor < app.file_scroll, "cursor (first file) is wheeled off-screen above");
     app.reveal_files = false;
-    app.move_cursor(-1).unwrap(); // `k` at row 0 — index stays 0
-    assert_eq!(app.file_cursor, 0);
+    app.move_cursor(-1).unwrap(); // `k` at the first file skips the header and stays put
+    assert_eq!(app.file_cursor, 1);
     assert!(app.reveal_files, "a clamp-to-same-index move still requests a reveal");
     app.reveal_file_cursor(vp);
-    assert_eq!(app.file_scroll, 0, "the cursor is pulled back into view");
+    assert_eq!(app.file_scroll, 1, "the first selectable row is pulled back into view");
 }
 
 #[test]
@@ -359,7 +402,7 @@ fn a_resting_pointer_keeps_the_arm_but_a_gesture_drops_it() {
     assert_eq!(app.armed_cross(), Some(true), "armed at a.rs's last hunk");
 
     // Mouse capture reports every pointer move over the pane. A pointer resting on the
-    // reviewr pane is not an input the reviewer made, so it must not drop the crossing
+    // Diple's refresh is not an input the reviewer made, so it must not drop the crossing
     // they armed.
     mouse(&mut app, &keymap, MouseEventKind::Moved);
     assert_eq!(app.armed_cross(), Some(true), "pointer motion is not a gesture");
@@ -496,7 +539,7 @@ fn hunk_steps_are_inert_where_no_change_rows_are_painted() {
     app.focus = Focus::Diff;
 
     // `All files` renders whole-file content: every row is context, so a step has no target.
-    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    enter_tab(&mut app, diple::app::Tab::AllFiles);
     let (path, cursor) = (app.diff_path.clone(), app.diff_cursor);
     app.next_hunk();
     assert_eq!((app.diff_path.clone(), app.diff_cursor), (path, cursor));
@@ -839,7 +882,7 @@ fn edit_reaches_a_file_the_changeset_only_calls_deleted() {
         app.entries.iter().any(|e| {
             e.path == "here.rs"
                 && e.annotation.as_ref().map(|a| a.change)
-                    == Some(herdr_reviewr::model::ChangeKind::Deleted)
+                    == Some(diple::model::ChangeKind::Deleted)
         }),
         "and calls it deleted"
     );
@@ -887,7 +930,7 @@ fn edit_opens_the_file_under_the_cursor_and_the_comment_when_one_is_there() {
 
     // The `All files` read pane is built by a different builder and its comments anchor to
     // content rather than to the diff, so both branches take a different route there.
-    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    enter_tab(&mut app, diple::app::Tab::AllFiles);
     app.focus = Focus::Diff;
     app.diff_cursor = 2;
     press(&mut app, &keymap, KeyCode::Char('e'));
@@ -992,8 +1035,8 @@ fn the_footer_offers_scope_everywhere_on_a_file_tab() {
 
 #[test]
 fn the_pr_footer_offers_open_for_any_resolved_pr() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::app::Tab;
+    use diple::forge::{PrSnapshot, PrView};
 
     let r = edited_repo();
     let mut app = app_on(&r);
@@ -1100,7 +1143,7 @@ fn esc_peels_one_layer_per_press() {
 
 #[test]
 fn esc_on_pr_closes_the_expansion_and_spares_the_frozen_file_tab() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = traversal_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
@@ -1120,7 +1163,7 @@ fn esc_on_pr_closes_the_expansion_and_spares_the_frozen_file_tab() {
 
 #[test]
 fn the_pr_move_band_drops_the_hunk_and_file_steps() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = edited_repo();
     let mut app = app_on(&r);
     app.set_tab(Tab::Pr).unwrap();
@@ -1133,7 +1176,7 @@ fn the_pr_move_band_drops_the_hunk_and_file_steps() {
 
 #[test]
 fn the_all_files_move_band_drops_the_inert_hunk_step() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     // Hunk stepping is inert outside the Changes diff (`step_hunk` early-returns), so the move band
     // must not advertise `] [ hunk` on All files, where file stepping still works.
     let r = edited_repo();
@@ -1483,7 +1526,7 @@ fn the_composer_reserve_keeps_the_anchored_line_visible() {
     // Mirror the event loop: reserve the box's rows, then clamp. The anchored line must
     // stay within the narrowed viewport so it renders above the box.
     let viewport = 12;
-    let effective = viewport - herdr_reviewr::ui::composer_height(&app, 80);
+    let effective = viewport - diple::ui::composer_height(&app, 80);
     clamp(&mut app, effective);
     assert!(
         (app.diff_scroll..app.diff_scroll + effective).contains(&app.diff_cursor),
@@ -1663,7 +1706,7 @@ fn divider_drag_math_and_keyboard_clamps_follow_all_four_positions() {
     let r = edited_repo();
     let mut app = app_on(&r);
     let area = Rect::new(0, 0, 100, 102); // a 100-cell split axis in either direction
-    let body = herdr_reviewr::ui::body_rect(area, &app);
+    let body = diple::ui::body_rect(area, &app);
     let heights = vec![1usize; app.visible.len()];
     let keymap = Keymap::default();
     let event = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
@@ -1679,7 +1722,7 @@ fn divider_drag_math_and_keyboard_clamps_follow_all_four_positions() {
         app.navigator_stack_pct = 25;
         let divider = (body.y..body.y + body.height)
             .flat_map(|row| (body.x..body.x + body.width).map(move |column| (column, row)))
-            .find(|&(column, row)| herdr_reviewr::ui::hit_divider(area, &app, column, row))
+            .find(|&(column, row)| diple::ui::hit_divider(area, &app, column, row))
             .unwrap();
         handle_mouse(
             &mut app,
@@ -1687,7 +1730,7 @@ fn divider_drag_math_and_keyboard_clamps_follow_all_four_positions() {
             area,
             &heights,
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
         handle_mouse(
@@ -1696,7 +1739,7 @@ fn divider_drag_math_and_keyboard_clamps_follow_all_four_positions() {
             area,
             &heights,
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
         handle_mouse(
@@ -1705,7 +1748,7 @@ fn divider_drag_math_and_keyboard_clamps_follow_all_four_positions() {
             area,
             &heights,
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
         assert_eq!(app.navigator_share(), 40, "event-level drag math for {position:?}");
@@ -1787,7 +1830,7 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
     press(&mut app, &keymap, KeyCode::Char('p'));
     assert_eq!(app.navigator_position, NavigatorPosition::Right, "the action is inert in list");
     app.mode = Mode::Normal;
-    app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
+    app.set_tab(diple::app::Tab::Pr).unwrap();
     press(&mut app, &keymap, KeyCode::Char('p'));
     assert_eq!(app.navigator_position, NavigatorPosition::Bottom, "the action works on PR");
     assert!(
@@ -1812,11 +1855,10 @@ fn navigator_hide_toggles_full_width_and_respects_modes() {
     press(&mut app, &keymap, KeyCode::Char('<'));
     assert_eq!(app.navigator_position, NavigatorPosition::Right, "`p` is inert while hidden");
     assert_eq!(app.navigator_side_pct, 32, "`<` is inert while hidden");
-    let body = herdr_reviewr::ui::body_rect(area, &app);
+    let body = diple::ui::body_rect(area, &app);
     let row = body.y + body.height / 2;
     assert!(
-        (body.x..body.x + body.width)
-            .all(|col| !herdr_reviewr::ui::hit_divider(area, &app, col, row)),
+        (body.x..body.x + body.width).all(|col| !diple::ui::hit_divider(area, &app, col, row)),
         "no divider exists while hidden"
     );
 
@@ -1858,13 +1900,13 @@ fn navigator_hide_toggles_full_width_and_respects_modes() {
     // `PR` is exempt: `z` inert there, and the state waits for the return to a file tab.
     press(&mut app, &keymap, KeyCode::Char('z'));
     assert!(app.navigator_hidden);
-    app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
+    app.set_tab(diple::app::Tab::Pr).unwrap();
     assert!(!app.navigator_hidden_here(), "`PR` always shows its navigator");
     press(&mut app, &keymap, KeyCode::Char('z'));
     assert!(app.navigator_hidden, "`z` is inert on `PR`");
     press(&mut app, &keymap, KeyCode::Tab);
     assert_eq!(app.focus, Focus::Files, "`PR` focuses its own navigator freely");
-    app.set_tab(herdr_reviewr::app::Tab::Changes).unwrap();
+    app.set_tab(diple::app::Tab::Changes).unwrap();
     assert!(app.navigator_hidden_here(), "the hidden state survives the `PR` visit");
     assert_eq!(app.focus, Focus::Diff, "and the return restores read-pane focus");
 }
@@ -1901,7 +1943,7 @@ fn footer_swaps_the_hide_key_between_go_and_row_one() {
         "`p layout` drops while hidden"
     );
 
-    app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
+    app.set_tab(diple::app::Tab::Pr).unwrap();
     let bands = app.footer_bands();
     assert!(
         !bands.iter().any(|&(a, _)| a == FooterAction::NavigatorHide),
@@ -1941,10 +1983,10 @@ fn divider_drag_cancels_until_mouse_up() {
     let mut app = app_on(&r);
     let keymap = Keymap::default();
     let area = Rect::new(0, 0, 120, 40);
-    let body = herdr_reviewr::ui::body_rect(area, &app);
+    let body = diple::ui::body_rect(area, &app);
     let row = body.y + body.height / 2;
     let divider = (body.x..body.x + body.width)
-        .find(|&col| herdr_reviewr::ui::hit_divider(area, &app, col, row))
+        .find(|&col| diple::ui::hit_divider(area, &app, col, row))
         .unwrap();
     let heights = vec![1usize; app.visible.len()];
     let event = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
@@ -1955,7 +1997,7 @@ fn divider_drag_cancels_until_mouse_up() {
         area,
         &heights,
         &keymap,
-        &herdr_reviewr::export::Clipboard,
+        &diple::export::Clipboard,
     )
     .unwrap();
     handle_mouse(
@@ -1964,7 +2006,7 @@ fn divider_drag_cancels_until_mouse_up() {
         area,
         &heights,
         &keymap,
-        &herdr_reviewr::export::Clipboard,
+        &diple::export::Clipboard,
     )
     .unwrap();
     let resized = app.navigator_side_pct;
@@ -1978,7 +2020,7 @@ fn divider_drag_cancels_until_mouse_up() {
         area,
         &heights,
         &keymap,
-        &herdr_reviewr::export::Clipboard,
+        &diple::export::Clipboard,
     )
     .unwrap();
     assert_eq!(app.navigator_side_pct, resized);
@@ -1990,7 +2032,7 @@ fn divider_drag_cancels_until_mouse_up() {
         area,
         &heights,
         &keymap,
-        &herdr_reviewr::export::Clipboard,
+        &diple::export::Clipboard,
     )
     .unwrap();
     assert!(!app.divider_drag_cancelled());
@@ -2008,7 +2050,7 @@ fn divider_drag_cancels_until_mouse_up() {
         area,
         &heights,
         &keymap,
-        &herdr_reviewr::export::Clipboard,
+        &diple::export::Clipboard,
     )
     .unwrap();
     assert!(!app.divider_drag_cancelled());
@@ -2018,12 +2060,12 @@ fn divider_drag_cancels_until_mouse_up() {
 fn navigator_config_changes_override_only_when_the_config_value_changes() {
     let r = edited_repo();
     let mut app = app_on(&r);
-    let default = herdr_reviewr::config::PluginConfig::default();
-    app.set_plugin_config(default.clone());
+    let default = diple::config::AppConfig::default();
+    app.set_app_config(default.clone());
     app.cycle_navigator_position();
     assert_eq!(app.navigator_position, NavigatorPosition::Bottom);
 
-    app.set_plugin_config(default);
+    app.set_app_config(default);
     assert_eq!(
         app.navigator_position,
         NavigatorPosition::Bottom,
@@ -2032,9 +2074,9 @@ fn navigator_config_changes_override_only_when_the_config_value_changes() {
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), "navigator_position = \"left\"\n").unwrap();
-    let changed = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
+    let changed = diple::config::app_config_in(dir.path()).unwrap();
     app.start_divider_drag();
-    app.set_plugin_config(changed);
+    app.set_app_config(changed);
     assert_eq!(app.navigator_position, NavigatorPosition::Left);
     assert!(app.divider_drag_cancelled(), "a config layout change cancels the old gesture");
 }
@@ -2064,11 +2106,11 @@ fn the_comment_box_grows_as_a_long_line_wraps() {
     app.start_comment();
     // A single long line with no explicit newline must still report more than one row.
     let width = 30; // narrow diff pane
-    let one_word = herdr_reviewr::ui::composer_height(&app, width);
+    let one_word = diple::ui::composer_height(&app, width);
     for ch in "the quick brown fox jumps over the lazy dog again and again".chars() {
         app.input_push(ch);
     }
-    let wrapped = herdr_reviewr::ui::composer_height(&app, width);
+    let wrapped = diple::ui::composer_height(&app, width);
     assert!(wrapped > one_word, "box grew from {one_word} to {wrapped} rows as text wrapped");
 }
 
@@ -2140,7 +2182,7 @@ fn editing_from_the_list_navigates_to_the_comments_file() {
     let mut app = app_on(&r);
 
     // Comment on b.rs, then move the view to a.rs.
-    let bi = app.entries.iter().position(|f| f.path == "b.rs").unwrap();
+    let bi = file_row(&app, "b.rs");
     app.select_file(bi).unwrap();
     app.focus = Focus::Diff;
     app.diff_cursor = row_with(&app, '+');
@@ -2149,7 +2191,7 @@ fn editing_from_the_list_navigates_to_the_comments_file() {
         app.input_push(ch);
     }
     app.submit_comment();
-    let ai = app.entries.iter().position(|f| f.path == "a.rs").unwrap();
+    let ai = file_row(&app, "a.rs");
     app.select_file(ai).unwrap();
     assert_eq!(app.diff_path.as_deref(), Some("a.rs"));
 
@@ -2338,7 +2380,7 @@ fn the_composer_reserve_follows_the_selections_last_line_not_the_cursor() {
     }
 
     let viewport = 12;
-    let effective = viewport - herdr_reviewr::ui::composer_height(&app, 80);
+    let effective = viewport - diple::ui::composer_height(&app, 80);
     clamp(&mut app, effective);
     let anchored = app.selection_range().1;
     assert!(
@@ -2367,7 +2409,7 @@ fn scope_cannot_change_while_composing() {
 
 #[test]
 fn tab_cannot_change_while_composing() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = edited_repo();
     let mut app = app_on(&r);
     app.focus = Focus::Diff;
@@ -2558,348 +2600,6 @@ fn jump_moves_the_cursor_onto_a_commented_line() {
     assert!(app.commented_lines().contains(&app.diff_cursor), "cursor landed on a comment");
 }
 
-// --- last-turn scope -----------------------------------------------------------
-
-/// One agent working in `cwd`, as `herdr agent list` would report it.
-fn agent_in(cwd: &Path, status: Status) -> AgentSample {
-    AgentSample { cwd: Some(cwd.to_string_lossy().into_owned()), status }
-}
-
-/// Drive one enumeration on the worker-owned turn host and mirror its baseline and
-/// membership into the app, exactly as a world completion landing would
-/// `None` is a failed enumeration.
-fn observe_agents(
-    app: &mut App,
-    host: &mut herdr_reviewr::world::TurnHost,
-    samples: Option<&[AgentSample]>,
-) {
-    let report = host.observe_agents(samples);
-    app.sync_turn_baseline(host.baseline().map(str::to_string));
-    app.sync_agents_present(report.agents_present);
-}
-
-/// An app and the worker's turn host on one repo, built the way `run` builds them: one
-/// resolved top level handed to both (`src/lib.rs` `repo_root`). The two derive the baseline
-/// ref key independently, and membership compares resolved top levels, so a test that opened
-/// them on the raw temp path would key them apart — on macOS a temp dir resolves `/var` to
-/// `/private/var`, and no agent cwd would ever match.
-fn turn_setup(r: &Repo) -> (App, herdr_reviewr::world::TurnHost) {
-    let root = herdr_reviewr::git::toplevel(r.path()).expect("a repo");
-    (App::new(root.clone(), Scope::LastTurn, None), herdr_reviewr::world::TurnHost::open(root))
-}
-
-/// The single-agent case the older tests drive: one agent at the worktree root.
-fn observe_turn(
-    app: &mut App,
-    host: &mut herdr_reviewr::world::TurnHost,
-    repo: &Path,
-    status: Option<Status>,
-) {
-    match status {
-        Some(status) => observe_agents(app, host, Some(&[agent_in(repo, status)])),
-        None => observe_agents(app, host, None),
-    }
-}
-
-#[test]
-fn last_turn_is_empty_until_a_turn_is_observed() {
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    let mut app = App::new(r.path_buf(), Scope::LastTurn, None);
-    app.reload().unwrap();
-    assert!(app.awaiting_turn(), "no baseline captured yet");
-    assert!(app.entries.is_empty(), "the scope is empty before a turn");
-}
-
-#[test]
-fn last_turn_shows_a_change_producing_turn() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working)); // turn start: candidate = "one"
-    r.write("a.rs", "one\ntwo\n");
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working)); // first change promotes the baseline
-    app.reload().unwrap();
-    assert!(!app.awaiting_turn(), "the baseline is now set");
-    assert!(app.entries.iter().any(|f| f.path == "a.rs"), "the turn's edit shows");
-}
-
-#[test]
-fn a_question_only_turn_keeps_the_previous_turns_diff() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    // Turn A edits a file.
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
-    r.write("a.rs", "one\ntwo\n");
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
-    // Turn B is a question — no file change.
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    app.reload().unwrap();
-    assert!(
-        app.entries.iter().any(|f| f.path == "a.rs"),
-        "A's diff persists across a question-only turn"
-    );
-}
-
-#[test]
-fn a_permission_pause_stays_one_turn() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working)); // turn start: candidate = "one"
-    r.write("a.rs", "one\nbefore\n"); // edit before the prompt
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Blocked)); // permission prompt promotes baseline = "one"
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working)); // resume — must NOT re-baseline
-    r.write("a.rs", "one\nbefore\nafter\n"); // edit after the prompt
-    observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
-    app.reload().unwrap();
-    let a = app.entries.iter().find(|f| f.path == "a.rs").expect("a.rs changed");
-    let annotation = a.annotation.as_ref().expect("a changed file is annotated");
-    assert_eq!(annotation.additions, 2, "both the pre- and post-prompt edits belong to one turn");
-}
-
-#[test]
-fn the_baseline_survives_a_restart() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    {
-        let (mut app, mut host) = turn_setup(&r);
-        observe_turn(&mut app, &mut host, r.path(), Some(Status::Idle));
-        observe_turn(&mut app, &mut host, r.path(), Some(Status::Working));
-        r.write("a.rs", "one\ntwo\n");
-        observe_turn(&mut app, &mut host, r.path(), Some(Status::Working)); // promotes and persists the ref
-    }
-    // A fresh App — a reviewr pane restart — resumes the persisted baseline. It reads the ref by
-    // the same key the host wrote it under, which is why both resolve the repo the one way.
-    let (mut restarted, _) = turn_setup(&r);
-    restarted.reload().unwrap();
-    assert!(!restarted.awaiting_turn(), "baseline resumed from the private ref");
-    assert!(restarted.entries.iter().any(|f| f.path == "a.rs"), "the turn's edit still shows");
-}
-
-#[test]
-fn no_agent_status_pauses_tracking() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    observe_turn(&mut app, &mut host, r.path(), None); // no herdr / no resolvable agent
-    r.write("a.rs", "one\ntwo\n");
-    observe_turn(&mut app, &mut host, r.path(), None);
-    app.reload().unwrap();
-    assert!(app.awaiting_turn(), "without a status signal the baseline never forms");
-}
-
-#[test]
-fn two_agents_in_one_worktree_produce_one_turn() {
-    // HH-TURN-PER-WORKTREE: the turn is the worktree's, so a second agent joining an open
-    // turn never starts another one or re-baselines the first agent's work out of the diff.
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    let root = r.path().to_path_buf();
-
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&root, Status::Idle)]));
-    // Agent A starts. Candidate = "one".
-    observe_agents(
-        &mut app,
-        &mut host,
-        Some(&[agent_in(&root, Status::Working), agent_in(&root, Status::Idle)]),
-    );
-    r.write("a.rs", "one\ntwo\n");
-    // Agent B joins mid-turn. A restart here would drop the "two" edit from the diff.
-    observe_agents(
-        &mut app,
-        &mut host,
-        Some(&[agent_in(&root, Status::Working), agent_in(&root, Status::Working)]),
-    );
-    r.write("a.rs", "one\ntwo\nthree\n");
-    observe_agents(
-        &mut app,
-        &mut host,
-        Some(&[agent_in(&root, Status::Working), agent_in(&root, Status::Working)]),
-    );
-
-    app.reload().unwrap();
-    let a = app.entries.iter().find(|f| f.path == "a.rs").expect("a.rs changed");
-    let annotation = a.annotation.as_ref().expect("a changed file is annotated");
-    assert_eq!(annotation.additions, 2, "both agents' edits belong to the one open turn");
-}
-
-#[test]
-fn a_turn_ends_only_once_every_agent_rests() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    let root = r.path().to_path_buf();
-    let both = |a, b| vec![agent_in(&root, a), agent_in(&root, b)];
-
-    observe_agents(&mut app, &mut host, Some(&both(Status::Idle, Status::Idle)));
-    observe_agents(&mut app, &mut host, Some(&both(Status::Working, Status::Working)));
-    let still_working = host.observe_agents(Some(&both(Status::Idle, Status::Working)));
-    assert!(!still_working.ended, "one agent still working keeps the turn open");
-    let rested = host.observe_agents(Some(&both(Status::Idle, Status::Done)));
-    assert!(rested.ended, "the turn ends once every agent rests");
-}
-
-#[test]
-fn a_prompt_answered_into_rest_still_ends_the_turn() {
-    // working → blocked → idle never puts a working sample next to the end, so reading the
-    // edge off the previous sample alone would strand the `PR` tab's per-turn refetch.
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    let root = r.path().to_path_buf();
-
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&root, Status::Idle)]));
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&root, Status::Working)]));
-    let held = host.observe_agents(Some(&[agent_in(&root, Status::Blocked)]));
-    assert!(!held.ended, "the permission prompt holds the turn open");
-    let rested = host.observe_agents(Some(&[agent_in(&root, Status::Idle)]));
-    assert!(rested.ended, "answering the prompt into idle ends the turn");
-}
-
-#[test]
-fn an_empty_worktree_rests_so_the_first_agent_starts_a_turn() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-
-    observe_agents(&mut app, &mut host, Some(&[]));
-    assert_eq!(app.turn_wait_message(), "no agent works here", "no agents means empty");
-    // The first agent to arrive and work starts a turn, since the empty worktree rested.
-    observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Working)]));
-    assert_eq!(app.turn_wait_message(), "waiting for the first turn", "the agent is a member");
-    r.write("a.rs", "one\ntwo\n");
-    observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Working)]));
-
-    app.reload().unwrap();
-    assert!(!app.awaiting_turn(), "the arriving agent's turn formed a baseline");
-    assert!(app.entries.iter().any(|f| f.path == "a.rs"), "its edit shows");
-}
-
-#[test]
-fn an_agent_in_a_second_worktree_of_the_repository_is_not_a_member() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let elsewhere = tempfile::TempDir::new().expect("tempdir");
-    let sibling = elsewhere.path().join("wt");
-    r.git(&["worktree", "add", "-q", sibling.to_str().unwrap(), "-b", "other"]);
-
-    let (mut app, mut host) = turn_setup(&r);
-    // Rest first, so a wrongly-admitted sibling's rest→work edge would start a turn and
-    // fail the baseline assertion below rather than hiding behind the unobserved first sample.
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&sibling, Status::Idle)]));
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&sibling, Status::Working)]));
-    assert_eq!(
-        app.turn_wait_message(),
-        "no agent works here",
-        "a second worktree resolves to its own top level"
-    );
-
-    r.write("a.rs", "one\ntwo\n");
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&sibling, Status::Working)]));
-    app.reload().unwrap();
-    assert!(app.awaiting_turn(), "a non-member's work never forms this worktree's baseline");
-}
-
-#[test]
-fn an_agent_whose_cwd_is_not_an_absolute_path_is_not_a_member() {
-    // herdr's `cwd` is external input. `git -C ""` does no chdir at all and answers with
-    // reviewr's own directory — the reviewed repo — so a blank or relative spelling would
-    // otherwise admit an agent working somewhere else entirely.
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    let nowhere = |cwd: &str| AgentSample { cwd: Some(cwd.to_string()), status: Status::Working };
-
-    observe_agents(&mut app, &mut host, Some(&[nowhere(""), nowhere("sub")]));
-    assert_eq!(app.agents_present(), Some(false), "neither spelling names a worktree");
-    r.write("a.rs", "one\ntwo\n");
-    observe_agents(&mut app, &mut host, Some(&[nowhere("")]));
-    app.reload().unwrap();
-    assert!(app.awaiting_turn(), "a non-member never forms this worktree's baseline");
-}
-
-#[test]
-fn an_agent_in_a_subdirectory_belongs_to_the_worktree() {
-    // The path is not the repo root, so this goes through the git resolution rather than the
-    // exact-match fast path.
-    let r = Repo::init();
-    r.write("sub/a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-    let sub = r.path().join("sub");
-
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&sub, Status::Idle)]));
-    assert_eq!(
-        app.turn_wait_message(),
-        "waiting for the first turn",
-        "a subdirectory resolves to the same top level"
-    );
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&sub, Status::Working)]));
-    r.write("sub/a.rs", "one\ntwo\n");
-    observe_agents(&mut app, &mut host, Some(&[agent_in(&sub, Status::Working)]));
-
-    app.reload().unwrap();
-    assert!(!app.awaiting_turn(), "the subdirectory agent's turn counts");
-}
-
-#[test]
-fn a_failed_enumeration_keeps_the_previous_membership() {
-    let r = Repo::init();
-    r.write("a.rs", "one\n");
-    r.commit_all("init");
-    let (mut app, mut host) = turn_setup(&r);
-
-    // A hiccup before any poll has ever succeeded observed nothing, so it may not claim the
-    // worktree is empty — the reviewr pane has no idea yet.
-    observe_agents(&mut app, &mut host, None);
-    assert_eq!(app.agents_present(), None, "a failed enumeration observes nothing");
-    assert_eq!(app.turn_wait_message(), "waiting for the first turn", "so it waits");
-
-    observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Idle)]));
-    assert_eq!(app.turn_wait_message(), "waiting for the first turn");
-    observe_agents(&mut app, &mut host, None); // herdr hiccup
-    assert_eq!(
-        app.turn_wait_message(),
-        "waiting for the first turn",
-        "a failed enumeration never flips the empty state"
-    );
-
-    // A hiccup mid-turn neither ends the turn nor re-baselines it on resume: the edit made
-    // while herdr was unreachable stays inside the one open turn.
-    observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Working)]));
-    r.write("a.rs", "one\ntwo\n");
-    let hiccup = host.observe_agents(None);
-    assert!(!hiccup.ended, "a failed enumeration never ends the turn");
-    assert_eq!(hiccup.agents_present, None, "a failed enumeration observes nothing");
-    observe_agents(&mut app, &mut host, Some(&[agent_in(r.path(), Status::Working)]));
-    app.reload().unwrap();
-    let a = app.entries.iter().find(|f| f.path == "a.rs").expect("a.rs changed");
-    assert_eq!(a.annotation.as_ref().unwrap().additions, 1, "the mid-hiccup edit is in the turn");
-
-    let emptied = host.observe_agents(Some(&[]));
-    assert_eq!(emptied.agents_present, Some(false), "a successful empty enumeration observes it");
-}
-
 /// The visible-row index of the file at `path`, or `None` when it is hidden/absent.
 fn file_row_of(app: &App, path: &str) -> Option<usize> {
     app.file_rows
@@ -2909,8 +2609,8 @@ fn file_row_of(app: &App, path: &str) -> Option<usize> {
 
 #[test]
 fn all_files_tab_browses_the_whole_worktree_and_renders_content() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::diff::View;
+    use diple::app::Tab;
+    use diple::diff::View;
     let r = Repo::init();
     r.write("src/app.rs", "fn main() {}\n");
     r.write("src/ui.rs", "fn render() {}\n");
@@ -2945,7 +2645,7 @@ fn all_files_tab_browses_the_whole_worktree_and_renders_content() {
 
 #[test]
 fn a_tab_switch_paints_the_stashed_frame_and_requests_its_refresh() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "fn a() {}\n");
     r.commit_all("base");
@@ -2970,15 +2670,15 @@ fn a_tab_switch_paints_the_stashed_frame_and_requests_its_refresh() {
     );
 
     // The completion lands: the built snapshot reconciles and the view catches up.
-    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let snapshot = diple::world::build(&app.world_input()).unwrap();
     app.reconcile_world(snapshot);
     assert!(app.entries.iter().any(|e| e.path == "b.rs"), "the landing caught up");
 }
 
 #[test]
 fn switching_tabs_restores_each_tab_selection() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::diff::View;
+    use diple::app::Tab;
+    use diple::diff::View;
     let r = Repo::init();
     r.write("src/app.rs", "fn main() {}\n");
     r.write("README.md", "# hi\n");
@@ -3010,8 +2710,8 @@ fn switching_tabs_restores_each_tab_selection() {
 
 #[test]
 fn changed_count_and_staleness_stay_scope_based_on_all_files() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::model::Comment;
+    use diple::app::Tab;
+    use diple::model::Comment;
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.write("b.rs", "two\n");
@@ -3029,7 +2729,7 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
         lines: " two".into(),
         text: "?".into(),
         diff_anchored: true,
-        rev: herdr_reviewr::model::Rev::Worktree,
+        rev: diple::model::Rev::Worktree,
     };
     app.store.add(comment.clone());
 
@@ -3045,8 +2745,8 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
 /// The annotation on the `All files` row for `path`: `Some(Some(_))` annotated, `Some(None)`
 /// listed-but-unchanged, `None` not visible.
 #[allow(clippy::option_option)] // outer = row found, inner = its annotation
-fn annotation_of(app: &App, path: &str) -> Option<Option<herdr_reviewr::file_list::Annotation>> {
-    use herdr_reviewr::file_list::RowKind;
+fn annotation_of(app: &App, path: &str) -> Option<Option<diple::file_list::Annotation>> {
+    use diple::file_list::RowKind;
     app.file_rows.iter().find_map(|row| match &row.kind {
         RowKind::File { index, annotation } if app.entries[*index].path == path => {
             Some(annotation.clone())
@@ -3057,8 +2757,8 @@ fn annotation_of(app: &App, path: &str) -> Option<Option<herdr_reviewr::file_lis
 
 #[test]
 fn all_files_annotates_changed_files_only() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::model::ChangeKind;
+    use diple::app::Tab;
+    use diple::model::ChangeKind;
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.write("b.rs", "two\n");
@@ -3079,7 +2779,7 @@ fn all_files_annotates_changed_files_only() {
 
 #[test]
 fn switching_scope_on_all_files_remarks_in_place() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.write("b.rs", "two\n");
@@ -3115,7 +2815,7 @@ fn switching_scope_on_all_files_remarks_in_place() {
 
 #[test]
 fn all_files_lazily_loads_an_expanded_ignored_directory() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("src/app.rs", "fn main() {}\n");
     r.commit_all("init");
@@ -3155,7 +2855,7 @@ fn all_files_lazily_loads_an_expanded_ignored_directory() {
 
 #[test]
 fn content_comment_is_stale_only_when_its_file_is_deleted() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\n");
     r.commit_all("init");
@@ -3182,7 +2882,7 @@ fn content_comment_is_stale_only_when_its_file_is_deleted() {
 
 #[test]
 fn the_tabs_keep_independent_selections() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.commit_all("init"); // a clean worktree — no changes
@@ -3202,7 +2902,7 @@ fn the_tabs_keep_independent_selections() {
 
 #[test]
 fn a_file_view_comment_exports_as_path_line_with_a_context_snippet() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\ngamma\n");
     r.commit_all("init");
@@ -3228,8 +2928,8 @@ fn a_file_view_comment_exports_as_path_line_with_a_context_snippet() {
 
 #[test]
 fn an_oversize_file_in_all_files_degrades_to_a_notice() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::diff::{FileState, View};
+    use diple::app::Tab;
+    use diple::diff::{FileState, View};
     let r = Repo::init();
     r.write("small.rs", "fn main() {}\n");
     r.write("big.bin", &"x\n".repeat(1_100_000)); // ~2.2 MB, over the 2 MB budget
@@ -3245,7 +2945,7 @@ fn an_oversize_file_in_all_files_degrades_to_a_notice() {
 
 #[test]
 fn switching_to_an_empty_file_view_focuses_the_tree() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "alpha\n");
     r.commit_all("init");
@@ -3259,8 +2959,8 @@ fn switching_to_an_empty_file_view_focuses_the_tree() {
 
 #[test]
 fn a_diff_comment_does_not_render_in_the_file_view() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::diff::View;
+    use diple::app::Tab;
+    use diple::diff::View;
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\ngamma\n");
     r.commit_all("init");
@@ -3287,8 +2987,8 @@ fn a_diff_comment_does_not_render_in_the_file_view() {
 
 #[test]
 fn editing_a_comment_on_all_files_opens_the_file_view() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::diff::View;
+    use diple::app::Tab;
+    use diple::diff::View;
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\n");
     r.write("b.rs", "one\ntwo\n");
@@ -3320,7 +3020,7 @@ fn editing_a_comment_on_all_files_opens_the_file_view() {
 fn changing_scope_on_all_files_snaps_the_changes_diff_to_the_top() {
     use std::fmt::Write as _;
 
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     let mut body = String::new();
     for i in 0..40 {
@@ -3353,7 +3053,7 @@ fn changing_scope_on_all_files_snaps_the_changes_diff_to_the_top() {
 /// open file when returned to, even after passing through the read-only `PR` tab.
 #[test]
 fn the_pr_tab_detour_preserves_each_file_tab_state() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.write("b.rs", "two\n");
@@ -3387,8 +3087,8 @@ fn the_pr_tab_detour_preserves_each_file_tab_state() {
 /// tracks the selected comment, and `pr_move` clamps at both ends.
 #[test]
 fn pr_navigator_walks_comments_only_and_clamps() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{Check, CheckStatus, Comment, CommentKind, PrSnapshot, PrView};
+    use diple::app::Tab;
+    use diple::forge::{Check, CheckStatus, Comment, CommentKind, PrSnapshot, PrView};
 
     let finding = |author: &str| Comment {
         kind: CommentKind::Finding,
@@ -3434,8 +3134,8 @@ fn pr_navigator_walks_comments_only_and_clamps() {
 
 #[test]
 fn apply_pr_follows_the_selected_comment_across_a_refresh() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    use diple::app::Tab;
+    use diple::forge::{Comment, PrSnapshot, PrView};
 
     let comment = |author: &str, created: &str| Comment {
         author: author.into(),
@@ -3487,7 +3187,7 @@ fn apply_pr_follows_the_selected_comment_across_a_refresh() {
 
 #[test]
 fn a_held_resolution_and_a_transient_detach_keep_the_painted_pr() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::forge::{PrSnapshot, PrView};
 
     let repo = Repo::init();
     let mut app = app_on(&repo);
@@ -3514,17 +3214,14 @@ fn a_held_resolution_and_a_transient_detach_keep_the_painted_pr() {
 
 #[test]
 fn same_input_failure_preserves_any_visible_pr_snapshot_and_remedy() {
-    use herdr_reviewr::forge::PrView;
+    use diple::forge::PrView;
 
     let repo = Repo::init();
     let mut app = app_on(&repo);
     let no_pr = PrView::NoPr;
     app.apply_pr(no_pr.clone());
 
-    app.apply_pr(PrView::NotAuthed(
-        herdr_reviewr::git::Forge::GitHub,
-        "github.example.com".to_string(),
-    ));
+    app.apply_pr(PrView::NotAuthed(diple::git::Forge::GitHub, "github.example.com".to_string()));
 
     assert_eq!(app.pr, no_pr);
     assert_eq!(
@@ -3537,7 +3234,7 @@ fn same_input_failure_preserves_any_visible_pr_snapshot_and_remedy() {
 
 #[test]
 fn theme_selection_swaps_the_palette_and_falls_back() {
-    use herdr_reviewr::theme;
+    use diple::theme;
     let repo = Repo::init();
     let mut app = App::new(repo.path_buf(), Scope::Uncommitted, None);
 
@@ -3563,7 +3260,7 @@ fn mouse(app: &mut App, keymap: &Keymap, kind: MouseEventKind) {
     let area = Rect::new(0, 0, 120, 40);
     let heights = vec![1usize; app.visible.len()];
     let event = MouseEvent { kind, column: 10, row: 10, modifiers: KeyModifiers::NONE };
-    handle_mouse(app, event, area, &heights, keymap, &herdr_reviewr::export::Clipboard).unwrap();
+    handle_mouse(app, event, area, &heights, keymap, &diple::export::Clipboard).unwrap();
 }
 
 #[test]
@@ -3668,7 +3365,7 @@ fn find_type(app: &mut App, keymap: &Keymap, text: &str) {
 
 #[test]
 fn find_match_ranges_is_smart_case_and_non_overlapping() {
-    use herdr_reviewr::app::find_match_ranges;
+    use diple::app::find_match_ranges;
     // A lowercase query ignores case; the ranges are char indices.
     assert_eq!(find_match_ranges("Total total", "total", false), vec![(0, 5), (6, 11)]);
     // Any uppercase makes it case-sensitive.
@@ -3760,7 +3457,7 @@ fn find_opens_on_a_match_reading_its_ordinal_at_once() {
 
 #[test]
 fn find_searches_folded_content_and_a_step_expands_the_fold() {
-    use herdr_reviewr::diff::Row;
+    use diple::diff::Row;
     use std::fmt::Write as _;
     let r = Repo::init();
     let mut base = String::from("total = 0\n");
@@ -3794,7 +3491,7 @@ fn find_searches_folded_content_and_a_step_expands_the_fold() {
 
 #[test]
 fn find_is_inert_in_wrong_contexts() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = find_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
@@ -3824,7 +3521,7 @@ fn find_is_inert_in_wrong_contexts() {
 
 #[test]
 fn find_is_inert_without_content_rows() {
-    use herdr_reviewr::diff::Row;
+    use diple::diff::Row;
     // An empty file has no content rows, so `find_available` is false.
     let r = Repo::init();
     r.write("base.txt", "x\n");
@@ -3867,7 +3564,7 @@ fn a_poll_that_drops_the_open_file_force_closes_find() {
 
     // The agent removes `m.rs`: it leaves the changeset, so the read pane reconciles away.
     r.remove("m.rs");
-    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let snapshot = diple::world::build(&app.world_input()).unwrap();
     app.reconcile_world(snapshot);
     assert_ne!(app.mode, Mode::Find, "the band force-closes when its file is gone");
     assert!(app.find.is_none());
@@ -3885,7 +3582,7 @@ fn a_poll_keeping_the_open_file_leaves_find_open_and_re_derives() {
 
     // The agent edits `m.rs` but keeps it in the changeset, adding another `total`.
     r.write("m.rs", "let total = 1;\ncompute();\ntotal += 2;\nprint(total);\nreturn total;\n");
-    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let snapshot = diple::world::build(&app.world_input()).unwrap();
     app.reconcile_world(snapshot);
 
     assert_eq!(app.mode, Mode::Find, "a same-file poll keeps the band open (Continuity)");
@@ -3952,21 +3649,18 @@ fn the_comments_list_acts_through_the_same_bindings() {
 
 #[test]
 fn the_pr_remedy_names_the_rebound_refresh_key() {
-    use herdr_reviewr::forge::PrView;
+    use diple::forge::PrView;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), "[keybindings]\nrefresh = [\"R\"]\n").unwrap();
-    let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
+    let config = diple::config::app_config_in(dir.path()).unwrap();
 
     let repo = Repo::init();
     let mut app = app_on(&repo);
-    app.set_plugin_config(config);
+    app.set_app_config(config);
     app.apply_pr(PrView::NoPr);
 
-    app.apply_pr(PrView::NotAuthed(
-        herdr_reviewr::git::Forge::GitHub,
-        "github.example.com".to_string(),
-    ));
+    app.apply_pr(PrView::NotAuthed(diple::git::Forge::GitHub, "github.example.com".to_string()));
 
     assert!(
         app.pr_notice().is_some_and(|notice| notice.ends_with("then press R.")),
@@ -3978,7 +3672,7 @@ fn the_pr_remedy_names_the_rebound_refresh_key() {
 /// A repo with one markdown file and one code file, opened on the `All files` tab.
 /// The `Repo` rides along: dropping it deletes the tempdir under the app.
 fn markdown_app() -> (Repo, App) {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("README.md", "# Title\n\nalpha beta gamma\n");
     r.write("code.rs", "fn main() {}\n");
@@ -3991,7 +3685,7 @@ fn markdown_app() -> (Repo, App) {
 
 #[test]
 fn the_markdown_preview_toggles_on_a_markdown_file_in_either_tab() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("README.md", "# Title\n");
     r.commit_all("init");
@@ -4082,7 +3776,7 @@ fn the_preview_choice_survives_a_refresh_and_dies_with_a_file_change() {
 
 #[test]
 fn a_tab_switch_restores_the_preview_choice() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let (_repo, mut app) = markdown_app();
     app.toggle_preview();
     assert!(app.preview_active());
@@ -4099,8 +3793,8 @@ fn a_tab_switch_restores_the_preview_choice() {
 
 #[test]
 fn the_description_row_pins_first_and_follows_refetches() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    use diple::app::Tab;
+    use diple::forge::{Comment, PrSnapshot, PrView};
 
     let comment = |author: &str, created: &str| Comment {
         author: author.into(),
@@ -4155,7 +3849,7 @@ fn the_description_row_pins_first_and_follows_refetches() {
 
 #[test]
 fn the_toggle_carries_the_reading_position_block_aligned() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let doc = "# Title\n\npara one\n\n## Section two\n\npara two\n";
     let r = Repo::init();
     r.write("doc.md", doc);
@@ -4168,11 +3862,11 @@ fn the_toggle_carries_the_reading_position_block_aligned() {
 
     // Entering opens at the block holding the cursor's line ("para two", source line 7).
     // The expectation derives from the render contract, not a hardcoded layout index.
-    let theme = herdr_reviewr::theme::resolve(Some("catppuccin"));
-    let rendered = herdr_reviewr::markdown::render(
+    let theme = diple::theme::resolve(Some("catppuccin"));
+    let rendered = diple::markdown::render(
         doc,
         80,
-        &herdr_reviewr::highlight::Highlighter::new(theme.syntax),
+        &diple::highlight::Highlighter::new(theme.syntax),
         &theme.palette,
     );
     let block_start =
@@ -4205,7 +3899,7 @@ fn the_toggle_carries_the_reading_position_block_aligned() {
 
 #[test]
 fn a_degraded_markdown_file_never_previews() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("empty.md", "");
     r.commit_all("init");
@@ -4234,11 +3928,11 @@ fn the_diff_view_previews_and_returns_to_the_exact_position() {
         .iter()
         .position(|r| r.new_no().is_none() && r.old_no().is_some())
         .expect("a deletion row");
-    let theme = herdr_reviewr::theme::resolve(Some("catppuccin"));
-    let rendered = herdr_reviewr::markdown::render(
+    let theme = diple::theme::resolve(Some("catppuccin"));
+    let rendered = diple::markdown::render(
         "# Doc\n\nalpha\ngamma\n",
         80,
-        &herdr_reviewr::highlight::Highlighter::new(theme.syntax),
+        &diple::highlight::Highlighter::new(theme.syntax),
         &theme.palette,
     );
     let block = rendered.meta.iter().position(|m| m.source_line == 3).expect("the block renders");
@@ -4345,7 +4039,7 @@ fn a_scope_switch_holds_the_diff_preview() {
 
 #[test]
 fn each_file_tab_holds_its_own_diff_preview_choice() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("doc.md", "# Doc\n\nbody\n");
     r.commit_all("init");
@@ -4373,16 +4067,10 @@ fn each_file_tab_holds_its_own_diff_preview_choice() {
 
 /// A completion as the worker would send it: built now, for the app's current input,
 /// tagged `generation`.
-fn completion_for(app: &App, generation: u64) -> herdr_reviewr::world::WorldCompletion {
+fn completion_for(app: &App, generation: u64) -> diple::world::WorldCompletion {
     let input = app.world_input();
-    let snapshot = herdr_reviewr::world::build(&input).unwrap();
-    herdr_reviewr::world::WorldCompletion {
-        generation,
-        input,
-        reveal: false,
-        turn: None,
-        snapshot: Some(Ok(snapshot)),
-    }
+    let snapshot = diple::world::build(&input).unwrap();
+    diple::world::WorldCompletion { generation, input, reveal: false, snapshot: Some(Ok(snapshot)) }
 }
 
 #[test]
@@ -4394,38 +4082,11 @@ fn a_result_for_a_view_that_moved_on_is_discarded_whole() {
     app.set_scope(Scope::Branch).unwrap();
     let before = app.entries.clone();
     assert!(
-        herdr_reviewr::land_world_completion(&mut app, stale, 7),
+        diple::land_world_completion(&mut app, stale, 7),
         "the live generation clears the in-flight marker even when the view moved on"
     );
     assert_eq!(app.entries, before, "the mismatched snapshot never paints");
     assert!(app.world_request.is_some(), "a fresh refresh is queued for the current view");
-}
-
-#[test]
-fn a_superseded_completion_syncs_the_baseline_but_paints_nothing() {
-    let r = edited_repo();
-    let mut app = app_on(&r);
-    r.write("d.rs", "d\n");
-    let mut stale = completion_for(&app, 3);
-    stale.input.turn_baseline = Some("cafe".into());
-    stale.turn = Some(herdr_reviewr::world::TurnReport { ended: true, agents_present: Some(true) });
-    let before = app.entries.clone();
-    assert!(
-        !herdr_reviewr::land_world_completion(&mut app, stale, 4),
-        "a superseded tag never clears the live in-flight marker"
-    );
-    assert_eq!(app.entries, before, "a superseded snapshot never paints");
-    assert!(app.pr_pending.is_some(), "the turn end still schedules the PR refetch");
-    assert_eq!(
-        app.agents_present(),
-        Some(true),
-        "membership syncs from a superseded completion too"
-    );
-    assert_eq!(
-        app.world_input().turn_baseline.as_deref(),
-        Some("cafe"),
-        "the worker's baseline is authoritative even from a superseded completion"
-    );
 }
 
 #[test]
@@ -4444,7 +4105,7 @@ fn a_completion_landing_mid_composition_leaves_the_frozen_diff() {
     r.write("a.rs", "alpha\nBETA\ngamma\ndelta\nepsilon\nzeta\n");
     r.write("c.rs", "c\n");
     let early = completion_for(&app, 9);
-    assert!(herdr_reviewr::land_world_completion(&mut app, early, 9));
+    assert!(diple::land_world_completion(&mut app, early, 9));
 
     assert!(app.composing(), "still composing");
     assert_eq!(app.input, "half-written", "the draft is untouched");
@@ -4460,7 +4121,7 @@ fn a_reveal_completion_settles_the_tab_and_rearms_the_cursor_reveal() {
     let mut landing = completion_for(&app, 2);
     landing.reveal = true;
     app.reveal_files = false;
-    assert!(herdr_reviewr::land_world_completion(&mut app, landing, 2));
+    assert!(diple::land_world_completion(&mut app, landing, 2));
     assert!(app.reveal_files, "a switch-originated landing re-reveals the re-anchored cursor");
     assert!(app.entries.iter().any(|f| f.path == "c.rs"), "the landing caught up");
 }
@@ -4473,7 +4134,7 @@ fn a_landing_world_result_never_flips_the_hidden_navigator() {
     r.write("c.rs", "c\n");
     let mut landing = completion_for(&app, 2);
     landing.reveal = true;
-    assert!(herdr_reviewr::land_world_completion(&mut app, landing, 2));
+    assert!(diple::land_world_completion(&mut app, landing, 2));
     assert!(app.navigator_hidden, "the hidden state is place state; a landing reconciles only");
     assert_eq!(app.focus, Focus::Diff, "the settle keeps focus on the lone read pane");
 }
@@ -4482,9 +4143,9 @@ fn a_landing_world_result_never_flips_the_hidden_navigator() {
 fn outside_a_repo_the_build_yields_the_quiet_empty_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
-    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let snapshot = diple::world::build(&app.world_input()).unwrap();
     assert!(snapshot.entries.is_empty(), "no error, no entries — the empty state stays quiet");
-    assert!(herdr_reviewr::world::build_changed(&app.world_input()).unwrap().changed.is_empty());
+    assert!(diple::world::build_changed(&app.world_input()).unwrap().changed.is_empty());
 }
 
 #[test]
@@ -4494,7 +4155,7 @@ fn a_superseded_reveal_rearms_for_the_next_dispatch() {
     let mut superseded = completion_for(&app, 3);
     superseded.reveal = true;
     assert!(
-        !herdr_reviewr::land_world_completion(&mut app, superseded, 4),
+        !diple::land_world_completion(&mut app, superseded, 4),
         "the stale tag does not clear the live marker"
     );
     let request = app.world_request.expect("the undelivered reveal re-arms a refresh");
@@ -4503,7 +4164,7 @@ fn a_superseded_reveal_rearms_for_the_next_dispatch() {
 
 #[test]
 fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
-    use herdr_reviewr::world::{self, TurnHost, WorldJob};
+    use diple::world::{self, WorldJob};
     use std::sync::mpsc;
     let dir = tempfile::tempdir().unwrap();
     let (job_tx, job_rx) = mpsc::channel();
@@ -4512,15 +4173,12 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
     let mut newer = input.clone();
     newer.scope = Scope::Branch;
     // Both jobs queue before the worker starts, so the coalescing path is deterministic.
-    job_tx.send(WorldJob { generation: 1, input, sample_turn: true, reveal: false }).unwrap();
-    job_tx
-        .send(WorldJob { generation: 2, input: newer, sample_turn: false, reveal: true })
-        .unwrap();
-    let worker = world::spawn(TurnHost::open(dir.path().to_path_buf()), job_rx, res_tx);
+    job_tx.send(WorldJob { generation: 1, input, reveal: false }).unwrap();
+    job_tx.send(WorldJob { generation: 2, input: newer, reveal: true }).unwrap();
+    let worker = world::spawn(job_rx, res_tx);
     let completion = res_rx.recv().expect("one coalesced completion");
     assert_eq!(completion.generation, 2, "the latest request wins");
     assert_eq!(completion.input.scope, Scope::Branch, "the newest input is the one built");
-    assert!(completion.turn.is_some(), "the superseded job's sample still runs");
     assert!(completion.reveal, "the superseded job's reveal is kept by OR");
     drop(job_tx);
     assert!(res_rx.recv().is_err(), "exactly one completion lands for the coalesced pair");
@@ -4532,10 +4190,10 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
 mod search_overlay {
     use super::{common, press};
     use common::{Repo, app_on, enter_tab};
-    use herdr_reviewr::app::{App, Focus, Mode, SearchPhase, Tab};
-    use herdr_reviewr::keymap::{Keymap, default_keymap};
-    use herdr_reviewr::land_search_completion;
-    use herdr_reviewr::search::{
+    use diple::app::{App, Focus, Mode, SearchPhase, Tab};
+    use diple::keymap::{Keymap, default_keymap};
+    use diple::land_search_completion;
+    use diple::search::{
         CodeHit, FileHit, SearchCompletion, SearchJob, SearchOutcome, SearchResults,
     };
     use ratatui::crossterm::event::KeyCode;
@@ -4574,7 +4232,7 @@ mod search_overlay {
             enter_tab(&mut app, tab);
             let actions: Vec<_> = app.footer_bands().into_iter().map(|(a, _)| a).collect();
             assert!(
-                actions.contains(&herdr_reviewr::app::FooterAction::Search),
+                actions.contains(&diple::app::FooterAction::Search),
                 "the {tab:?} footer carries the search hint: {actions:?}"
             );
             open(&mut app, &keymap);
@@ -4586,7 +4244,7 @@ mod search_overlay {
 
     #[test]
     fn flip_keeps_query_and_lands_pick_on_first_row() {
-        use herdr_reviewr::app::SearchMode;
+        use diple::app::SearchMode;
         let repo = Repo::init();
         for f in ["a.rs", "b.rs", "c.rs"] {
             repo.write(f, "one\n");
@@ -4841,7 +4499,7 @@ mod search_overlay {
     /// that would not work.
     #[test]
     fn footer_offers_only_esc_when_nothing_pickable() {
-        use herdr_reviewr::app::{Band, FooterAction};
+        use diple::app::{Band, FooterAction};
         let repo = Repo::init();
         repo.write("a.rs", "one\n");
         repo.commit_all("c");
@@ -4892,20 +4550,20 @@ mod search_overlay {
         enter_tab(&mut app, Tab::AllFiles);
 
         let area = Rect::new(0, 0, 120, 40);
-        let body = herdr_reviewr::ui::body_rect(area, &app);
+        let body = diple::ui::body_rect(area, &app);
         let row = body.y + body.height / 2;
         let divider = (body.x..body.x + body.width)
-            .find(|&col| herdr_reviewr::ui::hit_divider(area, &app, col, row))
+            .find(|&col| diple::ui::hit_divider(area, &app, col, row))
             .unwrap();
         let heights = vec![1usize; app.visible.len()];
         let event = |kind, column| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
-        herdr_reviewr::handle_mouse(
+        diple::handle_mouse(
             &mut app,
             event(MouseEventKind::Down(MouseButton::Left), divider),
             area,
             &heights,
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
 
@@ -4915,13 +4573,13 @@ mod search_overlay {
         land_search_completion(&mut app, done(1, results(vec![file_hit("a.rs")], Vec::new())), 1);
         assert!(app.divider_drag_captured(), "the cancelled gesture still owns its events");
 
-        herdr_reviewr::handle_mouse(
+        diple::handle_mouse(
             &mut app,
             event(MouseEventKind::Up(MouseButton::Left), divider),
             area,
             &heights,
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
         assert!(!app.divider_drag_captured(), "mouse-up releases the capture");
@@ -4936,7 +4594,7 @@ mod search_overlay {
         use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
         fn key(app: &mut App, keymap: &Keymap, code: KeyCode, mods: KeyModifiers) {
             let area = ratatui::layout::Rect::new(0, 0, 120, 40);
-            herdr_reviewr::handle_key(app, KeyEvent::new(code, mods), area, keymap).unwrap();
+            diple::handle_key(app, KeyEvent::new(code, mods), area, keymap).unwrap();
         }
         let repo = Repo::init();
         repo.write("a.rs", "one\n");
@@ -4982,7 +4640,7 @@ mod search_overlay {
         use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
         fn key(app: &mut App, keymap: &Keymap, code: KeyCode, mods: KeyModifiers) {
             let area = ratatui::layout::Rect::new(0, 0, 120, 40);
-            herdr_reviewr::handle_key(app, KeyEvent::new(code, mods), area, keymap).unwrap();
+            diple::handle_key(app, KeyEvent::new(code, mods), area, keymap).unwrap();
         }
         let repo = Repo::init();
         repo.write("a.rs", "one\n");
@@ -5176,7 +4834,7 @@ mod search_overlay {
                 } else if path.extension().is_none_or(|e| e != "lock") {
                     // git writes its own locks whenever it likes — `maintenance.lock` lands
                     // mid-test on a CI runner with background maintenance on. Those are git's,
-                    // never reviewr's, and counting them fails the run for someone else's file.
+                    // never Diple's, and counting them fails the run for someone else's file.
                     // Everything else under `.git` still counts, so a stray ref write is caught.
                     out.push(path.strip_prefix(root).unwrap().to_string_lossy().into_owned());
                 }
@@ -5204,8 +4862,7 @@ mod search_overlay {
 
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let (res_tx, res_rx) = std::sync::mpsc::channel();
-        let worker =
-            herdr_reviewr::search::spawn(repo.path_buf(), cache.path().into(), job_rx, res_tx);
+        let worker = diple::search::spawn(repo.path_buf(), cache.path().into(), job_rx, res_tx);
         job_tx.send(SearchJob::Query { generation: 1, query: "alpha_marker".into() }).unwrap();
 
         // A warming engine answers `indexing…` first and re-runs by itself.
@@ -5254,297 +4911,40 @@ mod search_overlay {
     }
 }
 
-// --- Agent picker ------------------------------------
-
-fn choice(pane: &str, name: &str) -> AgentChoice {
-    AgentChoice { pane_id: pane.into(), name: name.into(), state: "idle".into(), tab: "1".into() }
-}
-
-fn three_agents() -> Vec<AgentChoice> {
-    vec![choice("w8:p1", "claude"), choice("w8:p2", "release-bot"), choice("w8:p3", "codex")]
-}
-
-/// An app with two comments written and the picker open over three agents.
-fn app_with_picker(r: &Repo) -> App {
-    let mut app = app_on(r);
-    comment_on(&mut app, '+', "one");
-    comment_on(&mut app, '-', "two");
-    app.open_picker(three_agents());
-    app
-}
+// --- Standalone send confirmation --------------------------------------------
 
 #[test]
-fn the_highlight_arms_the_last_sent_agent_else_row_one() {
+fn send_requires_confirmation_and_cancel_keeps_the_review() {
     let r = edited_repo();
-    // Driven through `open_picker`, the verb the send actually calls, so the arming rule and
-    // its wiring are proven together.
-    let armed = |last_sent: Option<&str>| {
-        let mut app = app_on(&r);
-        app.last_sent_pane = last_sent.map(str::to_string);
-        app.open_picker(three_agents());
-        app.picker_cursor
-    };
-    // The last-sent agent wins whenever it is still a candidate.
-    assert_eq!(armed(Some("w8:p3")), 2);
-    // Nothing sent this session, or a last-sent pane that has since closed: the first row.
-    assert_eq!(armed(None), 0);
-    assert_eq!(armed(Some("w8:pZ")), 0);
-}
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "check this");
 
-#[test]
-fn the_picker_moves_by_key_and_a_digit_past_the_last_row_is_inert() {
-    let r = edited_repo();
-    let mut app = app_with_picker(&r);
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(app.picker_cursor, 0);
+    app.begin_send();
+    assert_eq!(app.mode, Mode::ConfirmSend);
+    assert_eq!(app.store.len(), 1);
+    assert!(!app.should_quit);
 
-    // Through `handle_key`, so the picker's movement bindings are proven live, not just the verb.
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 1, "`j` moves the highlight down");
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 0, "`k` moves it back up");
-    handle_key(&mut app, KeyEvent::from(KeyCode::Down), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 1, "the arrows move it too");
-
-    app.picker_goto(2);
-    assert_eq!(app.picker_cursor, 2);
-    // A mistyped digit must not arm a neighbour the reviewer would then send to.
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('7')), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 2, "a row past the end is inert, not clamped");
-}
-
-#[test]
-fn the_picker_follows_a_down_rebind_like_the_main_view() {
-    let r = edited_repo();
-    let mut app = app_with_picker(&r);
-    let keymap = Keymap::resolve(&[(Action::Down, vec![Key::plain('x')])]).unwrap();
-    let area = Rect::new(0, 0, 80, 24);
-    assert_eq!(app.picker_cursor, 0);
-
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 1, "the rebound key moves the highlight");
-    handle_key(&mut app, KeyEvent::from(KeyCode::Down), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 1, "the freed arrow no longer moves it");
-}
-
-#[test]
-fn cancelling_the_picker_keeps_every_comment() {
-    let r = edited_repo();
-    let mut app = app_with_picker(&r);
-    let keymap = Keymap::default();
-
-    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), Rect::new(0, 0, 80, 24), &keymap).unwrap();
+    app.cancel_send();
     assert_eq!(app.mode, Mode::Normal);
-    assert_eq!(app.store.len(), 2, "cancelling consumes nothing");
-    assert!(app.picker_rows.is_empty(), "the frozen rows are dropped with the picker");
+    assert_eq!(app.store.len(), 1, "cancel consumes nothing");
+    assert!(app.send_output.is_none());
 }
 
-// `last used` arming is proven end to end in tests/send_flow.rs, against a real send through a
-// fake herdr — the only layer where the pane that was addressed and the pane that arms can differ.
-
 #[test]
-fn a_picker_opened_from_the_comments_list_closes_back_onto_it() {
+fn confirming_send_freezes_stdout_payload_then_closes() {
     let r = edited_repo();
     let mut app = app_on(&r);
-    comment_on(&mut app, '+', "one");
-    comment_on(&mut app, '-', "two");
-    app.open_list();
-    app.open_picker(three_agents());
-    assert_eq!(app.mode, Mode::Picker);
+    comment_on(&mut app, '+', "first finding");
+    comment_on(&mut app, '-', "second finding");
 
-    let keymap = Keymap::default();
-    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), Rect::new(0, 0, 80, 24), &keymap).unwrap();
-    assert_eq!(app.mode, Mode::List, "cancelling restores the list the reviewer was browsing");
-    assert_eq!(app.store.len(), 2, "cancelling consumes nothing");
+    app.begin_send();
+    app.confirm_send();
 
-    // The same restoration covers the find band: a header Send click while finding must
-    // not cost the reviewer their band when they cancel the picker.
-    app.close_list();
-    app.open_find();
-    let over_find = app.mode.clone();
-    app.open_picker(three_agents());
-    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), Rect::new(0, 0, 80, 24), &keymap).unwrap();
-    assert_eq!(app.mode, over_find, "cancelling restores the find band");
-}
-
-#[test]
-fn the_picker_swallows_every_key_it_does_not_bind() {
-    let r = edited_repo();
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-
-    // `q` must not quit and `y` must not copy: both would destroy or consume the review while
-    // the picker is up, and both are live in the comments list.
-    for code in [KeyCode::Char('q'), KeyCode::Char('y'), KeyCode::Char('r'), KeyCode::Char('s')] {
-        let mut app = app_with_picker(&r);
-        let rows_before = app.picker_rows.clone();
-        let status_before = app.status.clone();
-        handle_key(&mut app, KeyEvent::from(code), area, &keymap).unwrap();
-        assert!(!app.should_quit, "{code:?} quit the app from the picker");
-        assert_eq!(app.mode, Mode::Picker, "{code:?} left the picker");
-        assert_eq!(app.store.len(), 2, "{code:?} consumed comments from the picker");
-        // `y` reaching the clipboard and `s` re-entering the send both change these even where
-        // the action itself fails, so they catch the leak on a machine with no clipboard tool.
-        assert_eq!(app.picker_rows, rows_before, "{code:?} rebuilt the frozen rows");
-        assert_eq!(app.status, status_before, "{code:?} acted and reported from the picker");
-    }
-}
-
-#[test]
-fn a_chord_never_fires_the_pickers_irreversible_send() {
-    let r = edited_repo();
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-
-    // `alt+enter` and `shift+enter` insert a newline in the comment editor the reviewer left
-    // moments ago. Carried into the picker, that muscle memory must not send
-    // the whole review to the armed agent — only the bare key fires an irreversible action.
-    for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT, KeyModifiers::CONTROL] {
-        let mut app = app_with_picker(&r);
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, modifiers), area, &keymap).unwrap();
-        assert_eq!(app.mode, Mode::Picker, "{modifiers:?}+enter left the picker");
-        assert_eq!(app.store.len(), 2, "{modifiers:?}+enter consumed the review");
-
-        // A chorded digit must not move the highlight either: the row it would arm is the row
-        // the next bare `enter` sends to.
-        let mut app = app_with_picker(&r);
-        handle_key(&mut app, KeyEvent::new(KeyCode::Char('3'), modifiers), area, &keymap).unwrap();
-        assert_eq!(app.picker_cursor, 0, "{modifiers:?}+3 armed a row");
-    }
-
-    // `esc` stays permissive: cancelling is always safe, and no stray modifier may trap the
-    // reviewer in a modal that swallows every other key.
-    let mut app = app_with_picker(&r);
-    handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT), area, &keymap).unwrap();
-    assert_eq!(app.mode, Mode::Normal, "a modified `esc` still cancels");
-    assert_eq!(app.store.len(), 2, "cancelling consumes nothing");
-}
-
-#[test]
-fn the_picker_owns_its_keys_on_every_tab() {
-    use herdr_reviewr::app::Tab;
-
-    let r = edited_repo();
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-
-    // The picker is checked before the tab handlers, so no tab can eat a modal's keys. On the
-    // read-only PR tab, `q` quits and the digits switch tabs — both would act behind an open
-    // picker if the modal were checked second.
-    let mut app = app_with_picker(&r);
-    app.tab = Tab::Pr;
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('q')), area, &keymap).unwrap();
-    assert!(!app.should_quit, "`q` quit the app from a picker on the PR tab");
-    assert_eq!(app.mode, Mode::Picker, "`q` left the picker");
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('1')), area, &keymap).unwrap();
-    assert_eq!(app.tab, Tab::Pr, "`1` switched tabs behind the picker");
-    assert_eq!(app.picker_cursor, 0, "`1` moved the highlight, as the picker's own key");
-    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), area, &keymap).unwrap();
-    assert_eq!(app.mode, Mode::Normal, "`esc` still cancels from the PR tab");
-}
-
-#[test]
-fn a_second_open_never_stacks_a_picker_that_one_esc_cannot_leave() {
-    let r = edited_repo();
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-
-    // A second open must not capture `Picker` as the mode to restore, or `esc` would land back
-    // in a picker whose rows are gone — a modal that swallows every key and whose `enter` does
-    // nothing. The frozen row set also outranks a later one.
-    let mut app = app_with_picker(&r);
-    app.picker_goto(2);
-    app.open_picker(vec![choice("w8:p9", "other")]);
-    assert_eq!(app.picker_rows, three_agents(), "the second open replaced the frozen rows");
-    assert_eq!(app.picker_cursor, 2, "the second open moved the highlight");
-    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), area, &keymap).unwrap();
-    assert_eq!(app.mode, Mode::Normal, "one `esc` leaves the picker");
-
-    // A picker over no rows has nothing to choose and no `enter` that acts, so it never opens.
-    let mut app = app_on(&r);
-    comment_on(&mut app, '+', "one");
-    app.open_picker(Vec::new());
-    assert_eq!(app.mode, Mode::Normal, "an empty row set opens no modal");
-}
-
-#[test]
-fn the_picker_digits_are_literal_whatever_the_tab_keys_are_bound_to() {
-    let r = edited_repo();
-    let mut app = app_with_picker(&r);
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 80, 24);
-    let tab_before = app.tab;
-
-    handle_key(&mut app, KeyEvent::from(KeyCode::Char('2')), area, &keymap).unwrap();
-    assert_eq!(app.picker_cursor, 1, "`2` moved the highlight to row 2");
-    assert_eq!(app.tab, tab_before, "`2` did not switch tabs from inside the picker");
-}
-
-#[test]
-fn a_refresh_behind_the_picker_moves_neither_the_rows_nor_the_place() {
-    let r = edited_repo();
-    let mut app = app_with_picker(&r);
-    app.picker_goto(2);
-    let rows_before = app.picker_rows.clone();
-    let file_before = app.diff_path.clone();
-    let cursor_before = app.diff_cursor;
-    let frozen_diff = app.diff.clone();
-
-    // The open file shifts underneath the picker, and a second file appears. Rewriting `a.rs`
-    // is what makes this test detect the freeze: a new file alone never rebuilds the open diff.
-    r.write("a.rs", "alpha\nBETA\ngamma\ndelta\nepsilon\nzeta\n");
-    r.write("b.rs", "new\n");
-    app.reload().unwrap();
-
-    assert_eq!(app.picker_rows, rows_before, "the frozen rows never reorder or change");
-    assert_eq!(app.picker_cursor, 2, "the highlight stays where the reviewer put it");
-    assert_eq!(app.diff_path, file_before, "the place behind the picker is frozen");
-    assert_eq!(app.diff_cursor, cursor_before);
-    assert_eq!(app.diff, frozen_diff, "the open diff is frozen while the picker is up");
-    assert!(app.entries.iter().any(|f| f.path == "b.rs"), "the file list still refreshes");
-}
-
-#[test]
-fn a_config_error_closes_the_picker_and_keeps_the_comments() {
-    let r = edited_repo();
-    let mut app = app_with_picker(&r);
-
-    app.set_config_error("theme = \"not-a-theme\"".to_string());
-    assert_eq!(app.mode, Mode::Normal, "the picker's rows would be stale after recovery");
-    assert!(app.picker_rows.is_empty());
-    assert_eq!(app.store.len(), 2, "saved comments always survive a config error");
-
-    // A picker opened over the find band unwinds through that band's own closer, so recovery
-    // never meets a restored mode whose state has already been dropped.
-    let mut over_find = app_on(&r);
-    comment_on(&mut over_find, '+', "one");
-    over_find.open_find();
-    over_find.open_picker(three_agents());
-    over_find.set_config_error("theme = \"not-a-theme\"".to_string());
-    assert_eq!(over_find.mode, Mode::Normal, "the find band closes with the picker it held");
-
-    // A picker opened over the comments list leaves the list behind, which recovery carries with
-    // the comments, so the reviewer lands where they were rather than in `Normal`.
-    let mut over_list = app_on(&r);
-    comment_on(&mut over_list, '+', "one");
-    over_list.open_list();
-    over_list.open_picker(three_agents());
-    over_list.set_config_error("theme = \"not-a-theme\"".to_string());
-    assert_eq!(over_list.mode, Mode::List, "the list outlives the picker it held");
-    assert!(over_list.picker_rows.is_empty(), "the frozen rows would be stale after recovery");
-    assert_eq!(over_list.store.len(), 1, "saved comments always survive a config error");
-}
-
-#[test]
-fn the_picker_owns_the_whole_footer_bar() {
-    let r = edited_repo();
-    let app = app_with_picker(&r);
-    let bands: Vec<FooterAction> = app.footer_bands().into_iter().map(|(a, _)| a).collect();
-    assert_eq!(
-        bands,
-        vec![FooterAction::PickAgent, FooterAction::ClosePicker, FooterAction::MovePickerRow]
-    );
+    let output = app.send_output.as_deref().expect("a frozen review payload");
+    assert!(output.contains("first finding"));
+    assert!(output.contains("second finding"));
+    assert!(app.store.is_empty(), "confirmation consumes the emitted batch");
+    assert!(app.should_quit, "the terminal is restored before run emits the payload");
 }
 
 // --- Base picker -----------------------
@@ -5575,10 +4975,7 @@ fn the_base_picker_opens_on_every_scope_without_a_flag_and_a_pick_switches_to_br
     app.base_picker_move(1);
     app.base_picker_pick().unwrap();
     assert_eq!(app.scope, Scope::Branch, "a pick switches to the scope it configures");
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("dev")
-    );
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("dev"));
 
     app.set_scope(Scope::Uncommitted).unwrap();
     assert!(
@@ -5589,7 +4986,7 @@ fn the_base_picker_opens_on_every_scope_without_a_flag_and_a_pick_switches_to_br
     app.open_base_picker();
     assert_eq!(app.mode, Mode::BasePick);
     let bp = app.base_picker.as_ref().expect("picker state");
-    let names: Vec<&str> = bp.rows.iter().map(herdr_reviewr::app::BaseChoice::name).collect();
+    let names: Vec<&str> = bp.rows.iter().map(diple::app::BaseChoice::name).collect();
     assert!(!names.contains(&"feature"), "the checked-out branch is not listed");
     assert_eq!(bp.rows[0].name(), "main", "the default branch sorts ahead of recency");
     assert!(bp.rows[0].is_default());
@@ -5611,10 +5008,7 @@ fn typing_filters_and_enter_picks_the_highlight() {
     let r = based_repo();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("main")
-    );
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("main"));
     app.open_base_picker();
     app.input_push('d');
     app.input_push('e');
@@ -5622,11 +5016,8 @@ fn typing_filters_and_enter_picks_the_highlight() {
     assert_eq!(bp.filtered().len(), 1, "the filter matches anywhere in the name");
     app.base_picker_pick().unwrap();
     assert_eq!(app.mode, Mode::Normal, "a pick closes the picker");
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("dev")
-    );
-    let picked = r.git(&["show", "refs/worktree/reviewr/base-pick"]);
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("dev"));
+    let picked = r.git(&["show", "refs/worktree/diple/base-pick"]);
     assert_eq!(picked.trim(), "dev", "the pick persists in the private ref");
     assert!(
         app.entries.iter().any(|e| e.path == "a.rs"),
@@ -5652,24 +5043,18 @@ fn a_pick_retags_the_world_input() {
 #[test]
 fn picking_the_default_records_the_name() {
     let r = based_repo();
-    herdr_reviewr::git::write_base_pick(r.path(), "dev").unwrap();
+    diple::git::write_base_pick(r.path(), "dev").unwrap();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("dev")
-    );
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("dev"));
     app.open_base_picker();
     let bp = app.base_picker.as_ref().unwrap();
     assert_eq!(bp.rows[bp.cursor].name(), "dev", "the highlight opens on the current base");
     app.base_picker_goto(0);
     app.base_picker_pick().unwrap();
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("main"));
     assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("main")
-    );
-    assert_eq!(
-        herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(),
+        diple::git::read_base_pick(r.path()).unwrap().as_deref(),
         Some("main"),
         "choosing the default records that name"
     );
@@ -5821,26 +5206,20 @@ fn typing_head_tilde_stores_the_spelling() {
     app.base_picker_pick().unwrap();
     assert_eq!(app.mode, Mode::Normal);
     assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::oid),
         Some(parent.as_str())
     );
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("HEAD~1")
-    );
-    assert_eq!(herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(), Some("HEAD~1"));
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("HEAD~1"));
+    assert_eq!(diple::git::read_base_pick(r.path()).unwrap().as_deref(), Some("HEAD~1"));
 
     r.write("a.rs", "three\n");
     r.commit_all("later");
     let moved = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
     assert_ne!(moved, parent);
     app.reload().unwrap();
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("HEAD~1"));
     assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("HEAD~1")
-    );
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::oid),
         Some(moved.as_str()),
         "a later commit still diffs one back"
     );
@@ -5859,17 +5238,17 @@ fn enter_on_an_empty_list_probes_immediately() {
     app.base_picker_pick().unwrap();
     assert_eq!(app.mode, Mode::Normal);
     assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::oid),
         Some(parent.as_str())
     );
-    assert_eq!(herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(), Some("HEAD~1"));
+    assert_eq!(diple::git::read_base_pick(r.path()).unwrap().as_deref(), Some("HEAD~1"));
 }
 
 #[test]
 fn a_typed_sha_prefix_stores_the_abbreviated_sha() {
     let r = based_repo();
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     let prefix = short[..4].to_string();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
@@ -5878,12 +5257,9 @@ fn a_typed_sha_prefix_stores_the_abbreviated_sha() {
         app.input_push(ch);
     }
     app.base_picker_pick().unwrap();
+    assert_eq!(diple::git::read_base_pick(r.path()).unwrap().as_deref(), Some(short.as_str()));
     assert_eq!(
-        herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(),
-        Some(short.as_str())
-    );
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name),
         Some(short.as_str())
     );
     app.open_base_picker();
@@ -5895,7 +5271,7 @@ fn a_typed_sha_prefix_stores_the_abbreviated_sha() {
 fn a_short_sha_with_a_newline_can_be_pasted_and_picked() {
     let r = based_repo();
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
     app.open_base_picker();
@@ -5903,24 +5279,21 @@ fn a_short_sha_with_a_newline_can_be_pasted_and_picked() {
     assert_eq!(app.base_picker.as_ref().unwrap().query, short);
     app.base_picker_pick().unwrap();
     assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::oid),
         Some(parent.as_str())
     );
     assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name),
         Some(short.as_str())
     );
-    assert_eq!(
-        herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(),
-        Some(short.as_str())
-    );
+    assert_eq!(diple::git::read_base_pick(r.path()).unwrap().as_deref(), Some(short.as_str()));
 }
 
 #[test]
 fn a_current_named_rev_is_the_highlighted_row_on_reopen() {
     let r = based_repo();
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    herdr_reviewr::git::write_base_pick(r.path(), "HEAD~1").unwrap();
+    diple::git::write_base_pick(r.path(), "HEAD~1").unwrap();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
     app.open_base_picker();
@@ -5938,12 +5311,9 @@ fn picking_the_default_tips_sha_does_not_clear_the_pick() {
     app.open_base_picker();
     app.input_paste(&main);
     app.base_picker_pick().unwrap();
+    assert_eq!(diple::git::read_base_pick(r.path()).unwrap().as_deref(), Some(main.as_str()));
     assert_eq!(
-        herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(),
-        Some(main.as_str())
-    );
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::oid),
+        app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::oid),
         Some(main.as_str())
     );
 }
@@ -5951,14 +5321,11 @@ fn picking_the_default_tips_sha_does_not_clear_the_pick() {
 #[test]
 fn checking_out_a_picked_branch_does_not_turn_it_into_a_pin() {
     let r = based_repo();
-    herdr_reviewr::git::write_base_pick(r.path(), "dev").unwrap();
+    diple::git::write_base_pick(r.path(), "dev").unwrap();
     r.git(&["checkout", "-q", "dev"]);
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
-    assert_eq!(
-        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
-        Some("dev")
-    );
+    assert_eq!(app.branch_base.winner.as_ref().map(diple::git::ResolvedBase::name), Some("dev"));
     app.open_base_picker();
     let bp = app.base_picker.as_ref().unwrap();
     assert!(
@@ -5966,7 +5333,7 @@ fn checking_out_a_picked_branch_does_not_turn_it_into_a_pin() {
         "a live branch pick must not grow a SHA row"
     );
     assert!(bp.visible()[bp.cursor].oid().is_none(), "the highlight must not be a pin");
-    assert_eq!(herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(), Some("dev"));
+    assert_eq!(diple::git::read_base_pick(r.path()).unwrap().as_deref(), Some("dev"));
 }
 
 // ---- mouse text selection ----
@@ -6020,8 +5387,8 @@ fn last_copy() -> Option<String> {
 fn sel_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) {
     let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| herdr_reviewr::ui::render(f, app)).unwrap();
-    let heights = herdr_reviewr::ui::diff_row_heights(app, SEL_AREA);
+    terminal.draw(|f| diple::ui::render(f, app)).unwrap();
+    let heights = diple::ui::diff_row_heights(app, SEL_AREA);
     let event = MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE };
     handle_mouse(app, event, SEL_AREA, &heights, &Keymap::default(), &SelClipboard).unwrap();
 }
@@ -6029,7 +5396,7 @@ fn sel_mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) {
 /// The screen cell of `(row, display column)` in the read pane, for a short-lined file where
 /// each row paints one display line: the gutter is one bar cell, a 3-column number, a space.
 fn sel_cell(app: &App, row: usize, display_col: u16) -> (u16, u16) {
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, app);
     (inner.x + 5 + display_col, inner.y + u16::try_from(row).unwrap())
 }
 
@@ -6043,11 +5410,11 @@ fn a_text_drag_maps_tabs_and_wide_chars_and_extracts_source_text() {
     let (c2, r2) = sel_cell(&app, 2, 5);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c2, r2);
-    assert_eq!(herdr_reviewr::drag_text(&app, SEL_AREA).as_deref(), Some("beta\n\tif x {\n日本 z"));
+    assert_eq!(diple::drag_text(&app, SEL_AREA).as_deref(), Some("beta\n\tif x {\n日本 z"));
     // A drag onto the tab's expansion cells selects the tab character itself.
     let (c1, r1) = sel_cell(&app, 1, 2);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
-    assert_eq!(herdr_reviewr::drag_text(&app, SEL_AREA).as_deref(), Some("beta\n\t"));
+    assert_eq!(diple::drag_text(&app, SEL_AREA).as_deref(), Some("beta\n\t"));
     // A keypress cancels the drag: nothing copies, and the key still acts.
     press(&mut app, &Keymap::default(), KeyCode::Esc);
     assert!(app.text_drag().is_none());
@@ -6093,12 +5460,12 @@ fn a_release_on_the_mouse_down_cell_is_a_click_and_a_real_drag_copies() {
 
 #[test]
 fn ts_one_surface_a_drag_clamps_to_its_pane_and_skips_cards() {
-    use herdr_reviewr::selection::Surface;
+    use diple::selection::Surface;
     let r = selection_repo();
     let mut app = app_on(&r);
     // Extend into the navigator pane: the extent clamps into the read pane.
     let (c0, r0) = sel_cell(&app, 0, 0);
-    let files = herdr_reviewr::ui::files_inner_rect(SEL_AREA, &app);
+    let files = diple::ui::files_inner_rect(SEL_AREA, &app);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), files.x + 2, files.y + 1);
     let drag = app.text_drag().expect("drag still live");
@@ -6115,7 +5482,7 @@ fn ts_one_surface_a_drag_clamps_to_its_pane_and_skips_cards() {
     typed(&mut app, "watch this");
     press(&mut app, &Keymap::default(), KeyCode::Enter);
     assert_eq!(app.store.len(), 1);
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     let (c0, r0) = sel_cell(&app, 0, 0);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 5 + 5, inner.y + 5);
@@ -6152,7 +5519,7 @@ fn ts_one_surface_a_drag_clamps_to_its_pane_and_skips_cards() {
 fn the_gutter_click_and_drag_open_the_composer_and_stay_inert_while_composing() {
     let r = selection_repo();
     let mut app = app_on(&r);
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     let gutter_x = inner.x + 1;
 
     // A gutter click opens the composer on that line, acting as `c` there.
@@ -6213,8 +5580,8 @@ fn a_double_click_copies_the_word_and_settles_its_highlight() {
     // The settled span paints in the selection fill, distinct from the cursor row's
     let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    terminal.draw(|f| diple::ui::render(f, &app)).unwrap();
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     let cell = terminal.backend().buffer().cell((inner.x + 5, inner.y)).unwrap();
     assert_eq!(cell.style().bg, Some(app.palette().sel_bg));
 
@@ -6299,7 +5666,7 @@ fn a_settled_preview_highlight_follows_its_source_text() {
     r.write("doc.md", "# Title\n\nplain body words changed\n");
     let mut app = app_on(&r);
     app.toggle_preview();
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     // Settle the heading word by double-click on the painted surface.
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x, inner.y);
@@ -6321,7 +5688,7 @@ fn a_settled_preview_highlight_follows_its_source_text() {
 fn a_mouse_down_on_blank_space_arms_no_gesture() {
     let r = selection_repo();
     let mut app = app_on(&r);
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     // The pane's blank space below the last content row starts nothing
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x + 4, inner.y + 20);
     assert!(app.text_drag().is_none(), "no drag starts on blank space");
@@ -6355,32 +5722,33 @@ fn the_navigator_click_survives_a_one_cell_slip_and_a_row_drag_copies_paths() {
     let r = selection_repo();
     r.write("sub/two.rs", "two\n");
     let mut app = app_on(&r);
-    let files = herdr_reviewr::ui::files_inner_rect(SEL_AREA, &app);
+    let files = diple::ui::files_inner_rect(SEL_AREA, &app);
     let rows = app.file_rows.len();
     assert!(rows >= 2, "the tree lists m.rs and sub/two.rs");
 
     // A release one cell over on the same row still activates the row.
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, files.y);
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), files.x + 2, files.y);
-    assert_eq!(app.file_cursor, 0, "the slipped click still selects the row");
+    let first_file_y = files.y + 1;
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, first_file_y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), files.x + 2, first_file_y);
+    assert_eq!(app.file_cursor, 1, "the slipped click still selects the row");
     assert!(app.text_drag().is_none());
 
     // A drag across rows selects them; the copy is their full repo-relative paths, the
     // tree's directories included. The start cell differs from the click above, so the
     // multi-click window stays out of the way.
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 4, files.y);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 4, first_file_y);
     let last = files.y + u16::try_from(rows - 1).unwrap();
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), files.x + 4, last);
-    let text = herdr_reviewr::drag_text(&app, SEL_AREA).unwrap();
+    let text = diple::drag_text(&app, SEL_AREA).unwrap();
     assert!(text.contains("m.rs"), "paths, not display names: {text}");
     assert!(text.contains("sub/two.rs"), "the full path, directories included: {text}");
     press(&mut app, &Keymap::default(), KeyCode::Esc);
 
     // A navigator double-click copies one row's full path alone.
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, files.y);
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), files.x + 1, files.y);
-    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, files.y);
-    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), files.x + 1, files.y);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, first_file_y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), files.x + 1, first_file_y);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, first_file_y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), files.x + 1, first_file_y);
     let copied = last_copy().expect("the double copied a path");
     assert!(!copied.contains('\n'), "one row: {copied}");
     assert!(!copied.starts_with('/'), "repo-relative, never absolute: {copied}");
@@ -6416,7 +5784,7 @@ fn a_navigator_drag_gates_the_world_drain_and_its_end_lifts_the_gate() {
     let r = selection_repo();
     r.write("sub/two.rs", "two\n");
     let mut app = app_on(&r);
-    let files = herdr_reviewr::ui::files_inner_rect(SEL_AREA, &app);
+    let files = diple::ui::files_inner_rect(SEL_AREA, &app);
 
     // The drag anchors to the file rows a snapshot rebuilds: the event loop holds the world
     // drain, so the completion waits in its channel with nothing stored
@@ -6463,13 +5831,13 @@ fn a_release_lost_past_the_border_still_copies() {
         modifiers: KeyModifiers::NONE,
     };
     assert!(
-        herdr_reviewr::pointer_at_pane_edge(event, SEL_AREA),
+        diple::pointer_at_pane_edge(event, SEL_AREA),
         "the pane's edge column is the exit signature"
     );
 
     // The exit deadline completes the gesture: the visible selection copies
     // (TS-NO-SILENT-LOSS), loudly and exactly.
-    herdr_reviewr::complete_gesture(&mut app, SEL_AREA, &SelClipboard);
+    diple::complete_gesture(&mut app, SEL_AREA, &SelClipboard);
     assert!(!app.gesture_active());
     assert_eq!(app.status, "copied 18 chars", "the lost release still copies");
     assert_eq!(last_copy().as_deref(), Some("alpha beta\n\tif x {"));
@@ -6479,13 +5847,13 @@ fn a_release_lost_past_the_border_still_copies() {
 fn a_still_pointer_inside_the_pane_is_a_held_button_not_an_exit() {
     let r = selection_repo();
     let mut app = app_on(&r);
-    let content = herdr_reviewr::ui::read_content_rect(SEL_AREA, &app);
+    let content = diple::ui::read_content_rect(SEL_AREA, &app);
     let (c0, r0) = sel_cell(&app, 0, 0);
     let (c1, r1) = sel_cell(&app, 1, 2);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
 
-    // A release anywhere inside the pane would have arrived — herdr routes by pointer
+    // A release anywhere inside the pane would have arrived — terminal mouse input routes by pointer
     // position — so stillness there proves the button is still down: no exit signature,
     // even on the read pane's own border row, and the gesture waits for a proof
     for (col, row) in [(c1, r1), (c0, content.y + content.height)] {
@@ -6495,7 +5863,7 @@ fn a_still_pointer_inside_the_pane_is_a_held_button_not_an_exit() {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(!herdr_reviewr::pointer_at_pane_edge(event, SEL_AREA));
+        assert!(!diple::pointer_at_pane_edge(event, SEL_AREA));
     }
     press(&mut app, &Keymap::default(), KeyCode::Esc);
 }
@@ -6508,7 +5876,7 @@ fn a_press_that_never_moved_dissolves_on_the_deadline_with_nothing() {
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     let cursor = app.diff_cursor;
 
-    herdr_reviewr::complete_gesture(&mut app, SEL_AREA, &SelClipboard);
+    diple::complete_gesture(&mut app, SEL_AREA, &SelClipboard);
     assert!(!app.gesture_active());
     assert_eq!(app.status, "", "no selection was visible, so nothing copies");
     assert_eq!(app.diff_cursor, cursor, "and no click fires");
@@ -6518,7 +5886,7 @@ fn a_press_that_never_moved_dissolves_on_the_deadline_with_nothing() {
 fn a_lost_gutter_drag_dissolves_without_the_composer() {
     let r = selection_repo();
     let mut app = app_on(&r);
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     let gutter_x = inner.x + 1;
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), gutter_x, inner.y);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), gutter_x, inner.y + 2);
@@ -6526,7 +5894,7 @@ fn a_lost_gutter_drag_dissolves_without_the_composer() {
 
     // TS-NO-SILENT-LOSS covers selections only: a lost gutter drag dissolves, and the
     // composer never opens unasked.
-    herdr_reviewr::complete_gesture(&mut app, SEL_AREA, &SelClipboard);
+    diple::complete_gesture(&mut app, SEL_AREA, &SelClipboard);
     assert!(!app.gesture_active());
     assert!(!app.composing(), "the composer opens only on the gutter's own release");
     assert!(app.select_anchor.is_none(), "the dissolved range clears");
@@ -6549,7 +5917,7 @@ fn a_press_inside_the_double_click_window_still_drags() {
     let (c2, r2) = sel_cell(&app, 2, 2);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c2, r2);
     assert_eq!(
-        herdr_reviewr::drag_text(&app, SEL_AREA).as_deref(),
+        diple::drag_text(&app, SEL_AREA).as_deref(),
         Some("pha beta\n\tif x {\n日本"),
         "the dragged-away press is a plain drag selection"
     );
@@ -6598,9 +5966,9 @@ fn the_next_mouse_down_completes_the_old_gesture_then_arms_its_own() {
 
 #[test]
 fn a_pr_navigator_row_copies_its_full_text_even_when_the_pane_truncates_it() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
-    use herdr_reviewr::selection::{Gesture, Point, Surface, TextDrag};
+    use diple::app::Tab;
+    use diple::forge::{Comment, PrSnapshot, PrView};
+    use diple::selection::{Gesture, Point, Surface, TextDrag};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -6621,7 +5989,7 @@ fn a_pr_navigator_row_copies_its_full_text_even_when_the_pane_truncates_it() {
         },
         count: 1,
     };
-    let text = herdr_reviewr::drag_text(&app, SEL_AREA).unwrap();
+    let text = diple::drag_text(&app, SEL_AREA).unwrap();
     assert!(text.contains(anchor), "the full anchor copies: {text}");
     app.gesture = Gesture::None;
 }
@@ -6650,7 +6018,7 @@ fn a_completed_drag_resets_the_multi_click_chain() {
 fn a_gutter_gesture_lands_right_with_the_find_band_open() {
     let r = selection_repo();
     let mut app = app_on(&r);
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     let gutter_x = inner.x + 1;
     app.open_find();
     assert_eq!(app.mode, Mode::Find);
@@ -6670,7 +6038,7 @@ fn a_gutter_gesture_lands_right_with_the_find_band_open() {
 
 #[test]
 fn a_preview_drag_selects_and_copies_the_painted_text() {
-    use herdr_reviewr::selection::Surface;
+    use diple::selection::Surface;
     let r = Repo::init();
     r.write("doc.md", "# Title\n\nplain body words\n");
     r.commit_all("init");
@@ -6678,7 +6046,7 @@ fn a_preview_drag_selects_and_copies_the_painted_text() {
     let mut app = app_on(&r);
     app.toggle_preview();
     assert!(app.preview_active());
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
 
     // The rendered heading is line 0; the drag selects its painted text and copies it.
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
@@ -6706,8 +6074,8 @@ fn a_preview_drag_selects_and_copies_the_painted_text() {
 
 #[test]
 fn a_pr_navigator_drag_gates_the_pr_drains() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    use diple::app::Tab;
+    use diple::forge::{Comment, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -6720,7 +6088,7 @@ fn a_pr_navigator_drag_gates_the_pr_drains() {
 
     // A drag over the `PR` navigator anchors to the fetched result: the event loop holds
     // both PR drains while it lives, and its end lifts the gate.
-    let files = herdr_reviewr::ui::files_inner_rect(SEL_AREA, &app);
+    let files = diple::ui::files_inner_rect(SEL_AREA, &app);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), files.x + 1, files.y);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), files.x + 1, files.y + 1);
     assert!(app.gesture_active());
@@ -6776,8 +6144,8 @@ fn the_drag_h_scroll_caps_at_the_widest_visible_row() {
     let r = selection_repo();
     let mut app = app_on(&r);
     app.wrap = false;
-    let content = herdr_reviewr::ui::read_content_rect(SEL_AREA, &app);
-    let widest = herdr_reviewr::ui::widest_visible_row(&app, SEL_AREA);
+    let content = diple::ui::read_content_rect(SEL_AREA, &app);
+    let widest = diple::ui::widest_visible_row(&app, SEL_AREA);
     assert!(widest > 0);
     let (c0, r0) = sel_cell(&app, 0, 0);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
@@ -6801,7 +6169,7 @@ fn the_drag_h_scroll_caps_at_the_widest_visible_row() {
 fn the_outermost_row_selects_without_scrolling_and_the_border_scrolls() {
     let r = selection_repo();
     let mut app = app_on(&r);
-    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    let inner = diple::ui::read_inner_rect(SEL_AREA, &app);
     let (c0, r0) = sel_cell(&app, 0, 0);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
     // The pane's last inner row selects without scrolling; only the border row and beyond
@@ -6833,7 +6201,7 @@ fn commits_repo() -> (Repo, Vec<String>) {
     (r, shas)
 }
 
-fn picker(app: &App) -> &herdr_reviewr::app::CommitPicker {
+fn picker(app: &App) -> &diple::app::CommitPicker {
     app.commit_picker.as_ref().expect("the commit picker is open")
 }
 
@@ -6846,7 +6214,7 @@ fn the_commit_picker_opens_on_every_file_tab_and_nowhere_else() {
     let (r, _) = commits_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
-    for scope in [Scope::Uncommitted, Scope::Branch, Scope::LastTurn] {
+    for scope in [Scope::Uncommitted, Scope::Branch] {
         app.set_scope(scope).unwrap();
         press(&mut app, &keymap, KeyCode::Char('G'));
         assert_eq!(app.mode, Mode::CommitPick, "opens under {scope:?}");
@@ -6858,16 +6226,16 @@ fn the_commit_picker_opens_on_every_file_tab_and_nowhere_else() {
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.scope, scope, "esc leaves the previous scope active");
     }
-    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    enter_tab(&mut app, diple::app::Tab::AllFiles);
     press(&mut app, &keymap, KeyCode::Char('G'));
     assert_eq!(app.mode, Mode::CommitPick, "opens on All files");
     press(&mut app, &keymap, KeyCode::Esc);
-    enter_tab(&mut app, herdr_reviewr::app::Tab::Pr);
+    enter_tab(&mut app, diple::app::Tab::Pr);
     press(&mut app, &keymap, KeyCode::Char('G'));
     assert_eq!(app.mode, Mode::Normal, "inert on the PR tab");
     press(&mut app, &keymap, KeyCode::Char('g'));
     assert_eq!(app.mode, Mode::Normal, "scope-commits is inert on the PR tab");
-    enter_tab(&mut app, herdr_reviewr::app::Tab::Changes);
+    enter_tab(&mut app, diple::app::Tab::Changes);
     app.set_scope(Scope::Uncommitted).unwrap();
     for (name, open) in [
         ("the comments list", Box::new(|a: &mut App| a.mode = Mode::List) as Box<dyn Fn(&mut App)>),
@@ -6901,10 +6269,10 @@ fn enter_picks_the_highlight_and_switches_to_the_commits_scope() {
     press(&mut app, &keymap, KeyCode::Enter);
     assert_eq!(app.mode, Mode::Normal);
     assert_eq!(app.scope, Scope::Commits);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[2])));
     assert_eq!(changed_paths(&app), ["two.rs"], "the commit alone, no worktree edit");
     let status = app.pick_status.as_ref().expect("the verdict lands with the changeset");
-    assert_eq!(status.verdict, herdr_reviewr::world::PickVerdict::Live);
+    assert_eq!(status.verdict, diple::world::PickVerdict::Live);
     assert_eq!(status.subject, "two");
     assert_eq!(app.changed_count(), 1);
 
@@ -6923,7 +6291,7 @@ fn enter_picks_the_highlight_and_switches_to_the_commits_scope() {
     assert_eq!(changed_paths(&app), ["two.rs"]);
 
     // The chip's `commits` step does the same.
-    app.set_scope(Scope::LastTurn).unwrap();
+    app.set_scope(Scope::Branch).unwrap();
     app.set_scope(app.scope.cycle()).unwrap();
     assert_eq!(app.scope, Scope::Commits);
 }
@@ -6980,13 +6348,13 @@ fn a_single_pick_reopens_without_an_anchor_so_k_enter_steps() {
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[1])));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[1])));
     press(&mut app, &keymap, KeyCode::Char('G'));
     assert_eq!(picker(&app).cursor, 2, "the highlight opens on the pick");
     assert!(picker(&app).anchor.is_none(), "a run of one reopens with no anchor");
     press(&mut app, &keymap, KeyCode::Char('k'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[2])));
     assert_eq!(changed_paths(&app), ["two.rs"]);
 }
 
@@ -7016,7 +6384,7 @@ fn every_other_key_is_inert_inside_the_commit_picker() {
     ] {
         press(&mut app, &keymap, code);
         assert_eq!(app.mode, Mode::CommitPick, "{code:?} is inert");
-        assert_eq!(app.tab, herdr_reviewr::app::Tab::Changes);
+        assert_eq!(app.tab, diple::app::Tab::Changes);
         assert_eq!(app.scope, Scope::Uncommitted);
         assert!(!app.should_quit);
         assert!(!app.keys_expanded);
@@ -7051,7 +6419,7 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[3])));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[3])));
     // Rewrite the tip under the pick.
     r.git(&["reset", "-q", "--hard", &shas[2]]);
     r.write("three.rs", "rewritten\n");
@@ -7059,7 +6427,7 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
     common::land_world(&mut app);
     assert_eq!(
         app.pick_status.as_ref().map(|s| &s.verdict),
-        Some(&herdr_reviewr::world::PickVerdict::OffBranch)
+        Some(&diple::world::PickVerdict::OffBranch)
     );
     assert_eq!(changed_paths(&app), ["three.rs"], "the run still paints");
     assert!(!app.commits_gone());
@@ -7080,7 +6448,7 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
     assert!(!picker(&app).in_run(0) && !picker(&app).in_run(1), "so no row wears the bar");
     assert_eq!(picker(&app).picked(), app.commit_pick, "and enter on the pick row re-picks it");
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[3])));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[3])));
     assert_eq!(app.scope, Scope::Commits);
 
     // A base change marks nothing.
@@ -7088,7 +6456,7 @@ fn an_off_branch_pick_keeps_painting_as_a_row_above_the_list() {
     common::land_world(&mut app);
     assert_eq!(
         app.pick_status.as_ref().map(|s| &s.verdict),
-        Some(&herdr_reviewr::world::PickVerdict::OffBranch)
+        Some(&diple::world::PickVerdict::OffBranch)
     );
 }
 
@@ -7106,7 +6474,7 @@ fn a_gone_pick_reads_as_gone_and_g_reopens_the_picker() {
     assert!(app.commits_gone());
     assert_eq!(
         app.pick_status.as_ref().map(|s| &s.verdict),
-        Some(&herdr_reviewr::world::PickVerdict::Gone(shas[3].clone()))
+        Some(&diple::world::PickVerdict::Gone(shas[3].clone()))
     );
     assert_eq!(app.commits_gone_message(), format!("commit {} is gone", &shas[3][..7]));
     assert!(changed_paths(&app).is_empty(), "the scope is empty");
@@ -7120,22 +6488,22 @@ fn a_gone_pick_reads_as_gone_and_g_reopens_the_picker() {
     press(&mut app, &keymap, KeyCode::Esc);
     assert_eq!(app.scope, Scope::Commits, "esc leaves the scope where it was");
     // `All files` keeps its content, and its own footer.
-    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    enter_tab(&mut app, diple::app::Tab::AllFiles);
     assert!(!app.entries.is_empty());
     let bands = app.footer_bands();
     assert_ne!(bands[0].0, FooterAction::CommitPick, "the gone row is the Changes tab's");
     assert!(bands.iter().any(|&(a, _)| a == FooterAction::TogglePane));
     // `g` from another scope knows the pick is gone and opens the picker instead of
     // switching into the empty scope.
-    enter_tab(&mut app, herdr_reviewr::app::Tab::Changes);
+    enter_tab(&mut app, diple::app::Tab::Changes);
     app.set_scope(Scope::Uncommitted).unwrap();
     press(&mut app, &keymap, KeyCode::Char('g'));
     assert_eq!(app.mode, Mode::CommitPick);
     assert_eq!(app.scope, Scope::Uncommitted, "without switching");
-    // The chip's cycle skips the gone pick, so a click from `last-turn` reaches
+    // The chip's cycle skips the gone pick, so a click from `branch` reaches
     // `uncommitted` instead of reopening the picker.
     press(&mut app, &keymap, KeyCode::Esc);
-    app.set_scope(Scope::LastTurn).unwrap();
+    app.set_scope(Scope::Branch).unwrap();
     assert_eq!(app.next_chip_scope(), Scope::Uncommitted);
 }
 
@@ -7144,11 +6512,11 @@ fn the_chip_skips_commits_until_a_pick_exists() {
     let (r, _) = commits_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::default();
-    app.set_scope(Scope::LastTurn).unwrap();
+    app.set_scope(Scope::Branch).unwrap();
     assert_eq!(app.next_chip_scope(), Scope::Uncommitted, "no pick yet");
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Enter);
-    app.set_scope(Scope::LastTurn).unwrap();
+    app.set_scope(Scope::Branch).unwrap();
     assert_eq!(app.next_chip_scope(), Scope::Commits, "a live pick is a chip stop");
 }
 
@@ -7163,14 +6531,14 @@ fn edit_never_lands_a_commit_comment_on_a_worktree_line() {
     assert_eq!(app.diff_path.as_deref(), Some("three.rs"));
     // `e` on the commit's diff opens the worktree file at its start: the diff's numbers
     // belong to the commit, not the file on disk.
-    app.focus = herdr_reviewr::app::Focus::Diff;
+    app.focus = diple::app::Focus::Diff;
     app.start_edit();
     let target = app.editor_request.take().unwrap();
     assert_eq!((target.path.as_str(), target.line), ("three.rs", 1));
     comment_on(&mut app, '+', "commit note");
     assert_eq!(
         app.store.get(0).unwrap().rev,
-        herdr_reviewr::model::Rev::Commit(herdr_reviewr::model::CommitPick::single(&shas[3]))
+        diple::model::Rev::Commit(diple::model::CommitPick::single(&shas[3]))
     );
     // Under a worktree scope the comment is in the list but its diff is not showing: `e`
     // is inert there and the footer does not offer it, so the box never opens over a
@@ -7179,7 +6547,7 @@ fn edit_never_lands_a_commit_comment_on_a_worktree_line() {
     app.select_file(0).unwrap();
     assert_eq!(app.diff_path.as_deref(), Some("root.rs"));
     // Opened from the diff pane, the way a reviewer reaches it.
-    app.focus = herdr_reviewr::app::Focus::Diff;
+    app.focus = diple::app::Focus::Diff;
     app.open_list();
     assert!(!app.footer_bands().iter().any(|&(a, _)| a == FooterAction::EditComment));
     app.start_edit();
@@ -7188,9 +6556,9 @@ fn edit_never_lands_a_commit_comment_on_a_worktree_line() {
     // file view's numbers are the worktree's.
     app.close_list();
     app.set_scope(Scope::Commits).unwrap();
-    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    enter_tab(&mut app, diple::app::Tab::AllFiles);
     app.select_file(file_row(&app, "root.rs")).unwrap();
-    app.focus = herdr_reviewr::app::Focus::Diff;
+    app.focus = diple::app::Focus::Diff;
     app.start_edit();
     assert_eq!(app.editor_request.take().unwrap().line, 1, "root.rs is one line");
 }
@@ -7200,7 +6568,7 @@ fn the_base_picker_opens_on_the_persisted_pick_from_any_scope() {
     let (r, shas) = commits_repo();
     r.set_origin_default("main", &shas[1]);
     r.git(&["branch", "dev", &shas[2]]);
-    herdr_reviewr::git::write_base_pick(r.path(), "dev").unwrap();
+    diple::git::write_base_pick(r.path(), "dev").unwrap();
     let mut app = app_on(&r);
     assert_eq!(app.scope, Scope::Uncommitted, "branch was never visited");
     app.open_base_picker();
@@ -7255,8 +6623,8 @@ fn a_stale_build_for_a_replaced_pick_is_discarded() {
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
-    assert!(herdr_reviewr::land_world_completion(&mut app, stale, 3));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[2])));
+    assert!(diple::land_world_completion(&mut app, stale, 3));
     assert_eq!(changed_paths(&app), ["two.rs"], "the old pick's build never paints");
     assert_eq!(app.pick_status.as_ref().unwrap().subject, "two");
     assert!(app.world_request.is_some(), "and a fresh build is requested");
@@ -7321,7 +6689,7 @@ fn a_poll_moves_the_pick_between_the_pick_row_and_the_list() {
     press(&mut app, &keymap, KeyCode::Char('v'));
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    let run = herdr_reviewr::model::CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
+    let run = diple::model::CommitPick { oldest: shas[1].clone(), newest: shas[2].clone() };
     assert_eq!(app.commit_pick, Some(run.clone()));
     // Reset below the run: the picker opens with the pick row above the one listed commit.
     r.git(&["reset", "-q", "--hard", &shas[0]]);
@@ -7356,7 +6724,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     // A worktree comment on the uncommitted edit.
     app.select_file(0).unwrap();
     comment_on(&mut app, '+', "worktree note");
-    assert_eq!(app.store.get(0).unwrap().rev, herdr_reviewr::model::Rev::Worktree);
+    assert_eq!(app.store.get(0).unwrap().rev, diple::model::Rev::Worktree);
     assert_eq!(app.commented_lines().len(), 1);
 
     // A commit comment on `two`.
@@ -7367,7 +6735,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     comment_on(&mut app, '+', "commit note");
     assert_eq!(
         app.store.get(1).unwrap().rev,
-        herdr_reviewr::model::Rev::Commit(herdr_reviewr::model::CommitPick::single(&shas[2]))
+        diple::model::Rev::Commit(diple::model::CommitPick::single(&shas[2]))
     );
     assert_eq!(app.commented_lines().len(), 1, "only the commit comment renders here");
 
@@ -7381,7 +6749,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     press(&mut app, &keymap, KeyCode::Enter);
     assert_eq!(
         app.commit_pick,
-        Some(herdr_reviewr::model::CommitPick { oldest: shas[1].clone(), newest: shas[3].clone() })
+        Some(diple::model::CommitPick { oldest: shas[1].clone(), newest: shas[3].clone() })
     );
     app.select_file(file_row(&app, "two.rs")).unwrap();
     assert!(app.commented_lines().is_empty(), "another run's diff carries no card");
@@ -7389,7 +6757,7 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
     press(&mut app, &keymap, KeyCode::Esc);
     press(&mut app, &keymap, KeyCode::Char('j'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[2])));
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[2])));
     app.select_file(file_row(&app, "two.rs")).unwrap();
     assert_eq!(app.commented_lines().len(), 1, "its own pick shows the card again");
 
@@ -7405,8 +6773,8 @@ fn a_commit_comment_renders_only_while_the_scope_reads_that_commit() {
 
     // The list and the export carry both, unchanged.
     assert_eq!(app.store.len(), 2);
-    let all: Vec<&herdr_reviewr::model::Comment> = app.store.iter().collect();
-    let text = herdr_reviewr::export::format_all(&all);
+    let all: Vec<&diple::model::Comment> = app.store.iter().collect();
+    let text = diple::export::format_all(&all);
     assert!(text.contains("worktree note") && text.contains("commit note"));
 }
 
@@ -7417,8 +6785,8 @@ fn all_files_marks_the_run_and_lists_the_worktree() {
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('G'));
     press(&mut app, &keymap, KeyCode::Enter);
-    assert_eq!(app.commit_pick, Some(herdr_reviewr::model::CommitPick::single(&shas[3])));
-    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    assert_eq!(app.commit_pick, Some(diple::model::CommitPick::single(&shas[3])));
+    enter_tab(&mut app, diple::app::Tab::AllFiles);
     let marked: Vec<&str> =
         app.entries.iter().filter(|e| e.annotation.is_some()).map(|e| e.path.as_str()).collect();
     assert_eq!(marked, ["three.rs"], "only the run's files carry a mark");

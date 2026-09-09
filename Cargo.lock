@@ -459,6 +459,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "diple"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "fff-search",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "similar",
+ "syntect",
+ "tempfile",
+ "toml",
+ "two-face",
+ "unicode-width",
+]
+
+[[package]]
 name = "dirs"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,25 +919,6 @@ dependencies = [
  "heed-traits",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "herdr-reviewr"
-version = "0.36.2"
-dependencies = [
- "anyhow",
- "dirs 6.0.0",
- "fff-search",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "similar",
- "syntect",
- "tempfile",
- "toml",
- "two-face",
- "unicode-width",
 ]
 
 [[package]]

@@ -1,14 +1,14 @@
 //! Git access: scopes, changed files, and diffs.
 //!
-//! The only writes are private refs under `refs/worktree/reviewr/`. Nothing here
-//! commits, stages, or mutates the worktree, the index, or any branch.
+//! Browsing is read-only. Explicit stage/unstage actions update only the index, and the
+//! branch-base picker writes only Diple's private worktree ref.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{ChangeKind, ChangedFile, Scope};
+use crate::model::{ChangeKind, ChangedFile, Scope, StageStats, StatusCode};
 
 /// Run `git -C <repo> <args>` and return stdout. Errors on non-zero exit.
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -1003,13 +1003,102 @@ pub fn file_content(repo: &Path, rev: &str, path: &str) -> String {
     git_lenient(repo, &["show", &format!("{rev}:{path}")])
 }
 
+/// The index version of `path`. A missing index entry reads as empty content.
+pub fn index_content(repo: &Path, path: &str) -> String {
+    git_lenient(repo, &["show", &format!(":{path}")])
+}
+
+/// Copy the worktree version of one path into the index.
+pub fn stage(repo: &Path, path: &str) -> Result<()> {
+    stage_with_previous(repo, path, None)
+}
+
+/// Stage a path and, for a detected rename, its old path as one logical file operation.
+pub fn stage_with_previous(repo: &Path, path: &str, previous_path: Option<&str>) -> Result<()> {
+    let mut args = vec!["add", "-A", "--"];
+    if let Some(previous) = previous_path.filter(|previous| *previous != path) {
+        args.push(previous);
+    }
+    args.push(path);
+    git(repo, &args)?;
+    Ok(())
+}
+
+/// Restore one index entry from `HEAD`, leaving the worktree untouched.
+pub fn unstage(repo: &Path, path: &str) -> Result<()> {
+    unstage_with_previous(repo, path, None)
+}
+
+/// Unstage a path and, for a detected rename, restore both pathspecs from `HEAD` while leaving
+/// the worktree untouched.
+pub fn unstage_with_previous(repo: &Path, path: &str, previous_path: Option<&str>) -> Result<()> {
+    let mut paths = Vec::new();
+    if let Some(previous) = previous_path.filter(|previous| *previous != path) {
+        paths.push(previous);
+    }
+    paths.push(path);
+    if git_ok(repo, &["rev-parse", "--verify", "-q", "HEAD"]) {
+        let mut args = vec!["restore", "--staged", "--"];
+        args.extend(paths);
+        git(repo, &args)?;
+    } else {
+        let mut args = vec!["rm", "--cached", "-f", "--"];
+        args.extend(paths);
+        git(repo, &args)?;
+    }
+    Ok(())
+}
+
+/// Per-path index/worktree status from porcelain v1. The NUL form preserves path bytes
+/// without quoting and lists untracked files individually.
+pub fn status_codes(repo: &Path) -> HashMap<String, StatusCode> {
+    git(repo, &["status", "--porcelain=v1", "-z", "-uall"])
+        .map(|out| parse_status_codes(&out))
+        .unwrap_or_default()
+}
+
+fn parse_status_codes(out: &str) -> HashMap<String, StatusCode> {
+    let mut map = HashMap::new();
+    let mut fields = out.split('\0').filter(|field| !field.is_empty());
+    while let Some(record) = fields.next() {
+        let (Some(code), Some(path)) = (record.get(..2), record.get(3..)) else { continue };
+        if path.is_empty() {
+            continue;
+        }
+        let x = code.as_bytes()[0] as char;
+        let y = code.as_bytes()[1] as char;
+        if code.contains('R') || code.contains('C') {
+            // In `-z` output a rename/copy's source is the following field.
+            fields.next();
+        }
+        let incoming =
+            StatusCode { staged: (x != ' ').then_some(x), unstaged: (y != ' ').then_some(y) };
+        map.entry(path.to_string())
+            .and_modify(|current: &mut StatusCode| {
+                current.staged = merge_status_column(current.staged, incoming.staged);
+                current.unstaged = merge_status_column(current.unstaged, incoming.unstaged);
+            })
+            .or_insert(incoming);
+    }
+    map
+}
+
+/// Combine duplicate porcelain records for the same path (for example a staged deletion whose
+/// worktree copy is now untracked). A real index/worktree status is more specific than `?`.
+fn merge_status_column(current: Option<char>, incoming: Option<char>) -> Option<char> {
+    match (current, incoming) {
+        (_, Some(code)) if code != '?' => Some(code),
+        (None, incoming) => incoming,
+        (current, _) => current,
+    }
+}
+
 // --- base pick (branch scope) --------------------------------------------------
 //
-// One revision spelling per worktree: a blob under `refs/worktree/reviewr/base-pick`.
+// One revision spelling per worktree: a blob under `refs/worktree/diple/base-pick`.
 // Git isolates that namespace, so sibling worktrees do not share a pick.
 
-const BASE_PICK_REF: &str = "refs/worktree/reviewr/base-pick";
-const TURN_BASE_REF: &str = "refs/worktree/reviewr/turn-base";
+const BASE_PICK_REF: &str = "refs/worktree/diple/base-pick";
 
 /// The recorded pick's spelling, or `None` when no pick is recorded. One git call, so a
 /// concurrent write from another pane of this worktree can never split the read the way
@@ -1082,87 +1171,6 @@ fn git_stdin(repo: &Path, args: &[&str], input: &str) -> Result<String, GitFail>
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-// --- turn baseline (last-turn scope) -------------------------------------------
-//
-// The snapshot is non-disruptive: it writes a tree object from the worktree through
-// a temporary index, never touching the real index, the worktree, or any branch, and
-// persists the baseline at `refs/worktree/reviewr/turn-base`.
-
-/// A non-disruptive snapshot of the worktree as a tree object. Seeds a temporary index
-/// from the repo's real index so unchanged files keep their cached hash, then `add -A`
-/// and `write-tree`. Captures staged, unstaged, and untracked content alike. Touches
-/// only the object database and the temp index — never the real index or any ref.
-pub fn snapshot_worktree(repo: &Path) -> Result<String> {
-    let git_dir = PathBuf::from(git(repo, &["rev-parse", "--absolute-git-dir"])?.trim());
-    let tmp_index = git_dir.join("reviewr-turn-index");
-    let real_index = git_dir.join("index");
-    // Clear whatever a prior hard crash left — the temp index and the `.lock` git holds
-    // while writing it (a leftover lock fails every later `add` with "File exists") — then
-    // drop both on every exit path via the guard, so even a failed snapshot leaves nothing
-    // behind in the git dir.
-    let guard = TempIndex(&tmp_index);
-    guard.clear();
-    // Seed from the real index so git's stat cache lets unchanged files skip hashing;
-    // a fresh repo may have no index yet, so start empty in that case.
-    if real_index.exists() {
-        std::fs::copy(&real_index, &tmp_index).context("seeding the snapshot index")?;
-    }
-    git_with_index(repo, &tmp_index, &["add", "-A"])?;
-    let tree = git_with_index(repo, &tmp_index, &["write-tree"])?;
-    Ok(tree.trim().to_string())
-}
-
-/// Removes a temporary index and its git lock file on drop, so a snapshot that fails midway
-/// never leaves either behind.
-struct TempIndex<'a>(&'a Path);
-
-impl TempIndex<'_> {
-    /// Removes the index and the `<index>.lock` git creates beside it while writing. Safe at
-    /// any point we run: the lock's only legitimate holder is a live `git add` this process
-    /// spawned and has already waited on.
-    fn clear(&self) {
-        let _ = std::fs::remove_file(self.0);
-        let mut lock = self.0.as_os_str().to_owned();
-        lock.push(".lock");
-        let _ = std::fs::remove_file(Path::new(&lock));
-    }
-}
-
-impl Drop for TempIndex<'_> {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-/// Like [`git`], but runs against a throwaway index via `GIT_INDEX_FILE` so the snapshot
-/// never disturbs the repo's real index.
-fn git_with_index(repo: &Path, index: &Path, args: &[&str]) -> Result<String> {
-    let out = crate::proc::command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["-c", "core.quotepath=false"])
-        .args(args)
-        .env("GIT_INDEX_FILE", index)
-        .output()
-        .with_context(|| format!("running git {args:?}"))?;
-    if !out.status.success() {
-        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The persisted turn baseline tree for this worktree, if a baseline exists.
-pub fn read_baseline_ref(repo: &Path) -> Option<String> {
-    git_line(repo, &["rev-parse", "--verify", "--quiet", TURN_BASE_REF])
-}
-
-/// Persist the turn baseline tree under this worktree's private ref. `update-ref` is
-/// atomic, so the baseline is never half-written.
-pub fn write_baseline_ref(repo: &Path, sha: &str) -> Result<()> {
-    git(repo, &["update-ref", TURN_BASE_REF, sha])?;
-    Ok(())
-}
-
 /// git's well-known empty-tree object, used as the diff base when a repo has no commits.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -1177,7 +1185,6 @@ fn diff_base(repo: &Path) -> String {
 
 /// The changed files for `scope`, sorted by path. `branch_base` is the resolved base OID
 /// for the `branch` scope ([`resolve_base`]'s winner); with none the scope lists nothing.
-/// `last-turn` is resolved separately by [`changed_against_tree`], so it lists nothing here.
 pub fn changed_files(
     repo: &Path,
     scope: Scope,
@@ -1200,26 +1207,30 @@ pub fn changed_files(
             ),
             None => return Ok(Vec::new()),
         },
-        // `last-turn` and `commits` diff through their own entry points.
-        Scope::LastTurn | Scope::Commits => return Ok(Vec::new()),
+        // `commits` diffs through its own entry point.
+        Scope::Commits => return Ok(Vec::new()),
+    };
+    let status = if scope == Scope::Uncommitted { status_codes(repo) } else { HashMap::new() };
+    let (staged_counts, unstaged_counts) = if scope == Scope::Uncommitted {
+        (
+            parse_numstat(&git(repo, &["diff", "--cached", "--numstat", "-z"])?),
+            parse_numstat(&git(repo, &["diff", "--numstat", "-z"])?),
+        )
+    } else {
+        (HashMap::new(), HashMap::new())
     };
     // Branch diffs against the worktree, so like uncommitted it carries untracked files
     // that `git diff` never reports.
     let include_untracked = matches!(scope, Scope::Uncommitted | Scope::Branch);
-    assemble(repo, &numstat, &name_status, include_untracked)
-}
-
-/// The changed files between the turn baseline `tree` and the live worktree, for
-/// `last-turn`. Snapshots the worktree now and diffs tree-against-tree, so staged,
-/// unstaged, untracked, and committed-this-turn changes all show, with no phantom
-/// deletion for a file that is untracked at both ends (which a tree-vs-worktree diff
-/// would mis-report). Untracked files ride in the current snapshot, so no separate
-/// untracked pass is needed.
-pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>> {
-    let current = snapshot_worktree(repo)?;
-    let numstat = git(repo, &["diff", tree, &current, "--numstat", "-z"])?;
-    let name_status = git(repo, &["diff", tree, &current, "--name-status", "-z"])?;
-    assemble(repo, &numstat, &name_status, false)
+    assemble(
+        repo,
+        &numstat,
+        &name_status,
+        include_untracked,
+        &status,
+        &staged_counts,
+        &unstaged_counts,
+    )
 }
 
 /// The changed files between two commits, `old` against `new`, for the `commits` scope:
@@ -1227,7 +1238,7 @@ pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>>
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
     let numstat = git(repo, &["diff", old, new, "--numstat", "-z"])?;
     let name_status = git(repo, &["diff", old, new, "--name-status", "-z"])?;
-    assemble(repo, &numstat, &name_status, false)
+    assemble(repo, &numstat, &name_status, false, &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
 /// `sha`'s first parent, or the empty tree when `sha` is a root commit: the old side of a
@@ -1476,6 +1487,9 @@ fn assemble(
     numstat: &str,
     name_status: &str,
     include_untracked: bool,
+    status: &HashMap<String, StatusCode>,
+    staged_counts: &HashMap<String, (u32, u32)>,
+    unstaged_counts: &HashMap<String, (u32, u32)>,
 ) -> Result<Vec<ChangedFile>> {
     let counts = parse_numstat(numstat);
     let mut seen = HashSet::new();
@@ -1485,7 +1499,20 @@ fn assemble(
             continue;
         }
         let (additions, deletions) = counts.get(&path).copied().unwrap_or((0, 0));
-        files.push(ChangedFile { path, kind, additions, deletions, previous_path });
+        let status_code = status.get(&path).copied();
+        let stage_stats = status_code.map(|_| StageStats {
+            staged: staged_counts.get(&path).copied().unwrap_or((0, 0)),
+            unstaged: unstaged_counts.get(&path).copied().unwrap_or((0, 0)),
+        });
+        files.push(ChangedFile {
+            path,
+            kind,
+            additions,
+            deletions,
+            previous_path,
+            status_code,
+            stage_stats,
+        });
     }
 
     if include_untracked {
@@ -1498,12 +1525,16 @@ fn assemble(
             let path = path.to_string();
             if seen.insert(path.clone()) {
                 let additions = untracked_additions(repo, &path);
+                let status_code = status.get(&path).copied();
                 files.push(ChangedFile {
                     path,
                     kind: ChangeKind::Untracked,
                     additions,
                     deletions: 0,
                     previous_path: None,
+                    status_code,
+                    stage_stats: status_code
+                        .map(|_| StageStats { staged: (0, 0), unstaged: (additions, 0) }),
                 });
             }
         }
@@ -1598,10 +1629,30 @@ fn parse_name_status(out: &str) -> Vec<(ChangeKind, String, Option<String>)> {
 mod tests {
     use super::{
         ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
-        parse_name_status, parse_numstat,
+        parse_name_status, parse_numstat, parse_status_codes,
     };
+    use crate::model::StatusCode;
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
+
+    #[test]
+    fn porcelain_status_keeps_both_columns_and_rename_targets() {
+        let status = parse_status_codes(
+            "M  staged.rs\0 M working.rs\0MM both.rs\0?? fresh.rs\0R  new.rs\0old.rs\0",
+        );
+        assert_eq!(status["staged.rs"], StatusCode { staged: Some('M'), unstaged: None });
+        assert_eq!(status["working.rs"], StatusCode { staged: None, unstaged: Some('M') });
+        assert_eq!(status["both.rs"], StatusCode { staged: Some('M'), unstaged: Some('M') });
+        assert_eq!(status["fresh.rs"], StatusCode { staged: Some('?'), unstaged: Some('?') });
+        assert_eq!(status["new.rs"], StatusCode { staged: Some('R'), unstaged: None });
+        assert!(!status.contains_key("old.rs"));
+    }
+
+    #[test]
+    fn porcelain_status_merges_a_staged_delete_with_its_untracked_copy() {
+        let status = parse_status_codes("D  here.rs\0?? here.rs\0");
+        assert_eq!(status["here.rs"], StatusCode { staged: Some('D'), unstaged: Some('?') });
+    }
 
     fn github(host: &str) -> ForgeHosts<'_> {
         ForgeHosts { github: Some(host), ..NONE }
@@ -1839,8 +1890,8 @@ mod tests {
         );
         // A project named with a space travels percent-encoded and is addressed decoded.
         assert_eq!(
-            classify_remote("https://dev.azure.com/extruct/Extruct%20AI/_git/reviewr-qa", &NONE),
-            repo("dev.azure.com", "extruct", "Extruct AI", "reviewr-qa")
+            classify_remote("https://dev.azure.com/extruct/Extruct%20AI/_git/Diple-qa", &NONE),
+            repo("dev.azure.com", "extruct", "Extruct AI", "Diple-qa")
         );
         // The organization is case-insensitive on Azure DevOps and the legacy host derives
         // it lowercased, so every casing and clone form is one target.

@@ -1,4 +1,4 @@
-//! Command-line flags and the shared plugin configuration boundary.
+//! Command-line flags and Diple's configuration file.
 //!
 //! Flags override defaults; the positional
 //! argument (if any) is the repo path, else the current directory.
@@ -17,9 +17,9 @@ pub struct Config {
     pub theme: Option<String>,
     /// `Some(false)` when `--wrap off` is passed; `None` keeps the default (wrap on).
     pub wrap: Option<bool>,
-    /// The plugin config directory, resolved once at startup by [`resolve_config_dir`];
+    /// The Diple config directory, resolved once at startup by [`resolve_config_dir`];
     /// every later config read rereads only the file inside it.
-    pub plugin_config_dir: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -56,7 +56,7 @@ impl Config {
             base,
             theme,
             wrap,
-            plugin_config_dir: None,
+            config_dir: None,
         }
     }
 
@@ -66,13 +66,10 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 11] = [
+const APP_CONFIG_KEYS: [&str; 8] = [
     "theme",
     "default_scope",
     "navigator_position",
-    "toggle_placement",
-    "toggle_direction",
-    "auto_open",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -118,51 +115,12 @@ impl NavigatorPosition {
     }
 }
 
-/// Where the toggle action opens the reviewr pane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TogglePlacement {
-    Split,
-    Overlay,
-    Zoomed,
-    Tab,
-}
-
-impl TogglePlacement {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Split => "split",
-            Self::Overlay => "overlay",
-            Self::Zoomed => "zoomed",
-            Self::Tab => "tab",
-        }
-    }
-}
-
-/// Direction for split placement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToggleDirection {
-    Right,
-    Down,
-}
-
-impl ToggleDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Right => "right",
-            Self::Down => "down",
-        }
-    }
-}
-
 /// One validated snapshot of `config.toml` in the resolved config directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginConfig {
+pub struct AppConfig {
     theme: String,
     default_scope: crate::model::Scope,
     navigator_position: NavigatorPosition,
-    toggle_placement: TogglePlacement,
-    toggle_direction: ToggleDirection,
-    auto_open: bool,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -170,15 +128,12 @@ pub struct PluginConfig {
     keymap: crate::keymap::Keymap,
 }
 
-impl Default for PluginConfig {
+impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: crate::theme::DEFAULT.to_owned(),
             default_scope: crate::model::Scope::Uncommitted,
             navigator_position: NavigatorPosition::Right,
-            toggle_placement: TogglePlacement::Split,
-            toggle_direction: ToggleDirection::Right,
-            auto_open: true,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -188,12 +143,12 @@ impl Default for PluginConfig {
     }
 }
 
-impl PluginConfig {
+impl AppConfig {
     pub fn theme(&self) -> &str {
         &self.theme
     }
 
-    /// The scope a fresh reviewr pane is built with — startup and config recovery. A reread never
+    /// The scope a fresh Diple pane is built with — startup and config recovery. A reread never
     /// switches a running pane's scope.
     pub fn default_scope(&self) -> crate::model::Scope {
         self.default_scope
@@ -201,18 +156,6 @@ impl PluginConfig {
 
     pub fn navigator_position(&self) -> NavigatorPosition {
         self.navigator_position
-    }
-
-    pub fn toggle_placement(&self) -> TogglePlacement {
-        self.toggle_placement
-    }
-
-    pub fn toggle_direction(&self) -> ToggleDirection {
-        self.toggle_direction
-    }
-
-    pub fn auto_open(&self) -> bool {
-        self.auto_open
     }
 
     pub fn github_host(&self) -> Option<&str> {
@@ -246,7 +189,7 @@ impl PluginConfig {
         &self.keymap
     }
 
-    /// Stable machine-readable output consumed by the shell entry points.
+    /// Stable machine-readable representation, useful for diagnostics and tests.
     pub fn to_json(&self) -> serde_json::Value {
         let keybindings: serde_json::Map<String, serde_json::Value> = self
             .keymap
@@ -261,9 +204,6 @@ impl PluginConfig {
             "theme": self.theme,
             "default_scope": self.default_scope.name(),
             "navigator_position": self.navigator_position.as_str(),
-            "toggle_placement": self.toggle_placement.as_str(),
-            "toggle_direction": self.toggle_direction.as_str(),
-            "auto_open": self.auto_open,
             "github_host": self.github_host,
             "gitlab_host": self.gitlab_host,
             "azure_devops_host": self.azure_devops_host,
@@ -276,78 +216,67 @@ impl PluginConfig {
 /// A whole-file configuration failure. It keeps the path in the value so every entry point can
 /// show the same actionable diagnostic.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginConfigError {
+pub struct AppConfigError {
     path: PathBuf,
     detail: String,
 }
 
-impl PluginConfigError {
+impl AppConfigError {
     fn new(path: &Path, detail: impl Into<String>) -> Self {
         Self { path: path.to_owned(), detail: detail.into() }
     }
 }
 
-impl fmt::Display for PluginConfigError {
+impl fmt::Display for AppConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "config {}: {}", self.path.display(), self.detail)
     }
 }
 
-impl std::error::Error for PluginConfigError {}
+impl std::error::Error for AppConfigError {}
 
-/// The config directory, resolved once at an entrypoint's startup:
-/// `$HERDR_PLUGIN_CONFIG_DIR` when set, else the directory `cli` reports
-/// ([`crate::herdr::plugin_config_dir`]), else none — and none reads no config file.
-pub fn resolve_config_dir(cli: impl FnOnce() -> Option<String>) -> Option<PathBuf> {
-    config_dir_from(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR"), cli)
-}
-
-/// The resolution rule behind [`resolve_config_dir`], split out so tests can inject both
-/// inputs. An empty value names no directory on either branch — otherwise an empty env var
-/// would read `./config.toml` from the repo under review and block the pane on it.
-fn config_dir_from(
-    env: Option<std::ffi::OsString>,
-    cli: impl FnOnce() -> Option<String>,
-) -> Option<PathBuf> {
-    env.filter(|dir| !dir.is_empty())
+/// Diple's config directory: `$DIPLE_CONFIG_DIR`, or the platform config root plus `diple`.
+pub fn resolve_config_dir() -> Option<PathBuf> {
+    std::env::var_os("DIPLE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .or_else(|| cli().filter(|dir| !dir.is_empty()).map(PathBuf::from))
+        .or_else(|| dirs::config_dir().map(|root| root.join("diple")))
 }
 
-/// Read one plugin config snapshot from the resolved config directory. No directory reads no
+/// Read one config snapshot from the resolved config directory. No directory reads no
 /// config file, which is the missing-file outcome and uses every default.
-pub fn plugin_config(dir: Option<&Path>) -> Result<PluginConfig, PluginConfigError> {
+pub fn app_config(dir: Option<&Path>) -> Result<AppConfig, AppConfigError> {
     match dir {
-        Some(dir) => plugin_config_in(dir),
-        None => Ok(PluginConfig::default()),
+        Some(dir) => app_config_in(dir),
+        None => Ok(AppConfig::default()),
     }
 }
 
-/// Read one plugin config snapshot from `<dir>/config.toml`.
-pub fn plugin_config_in(dir: impl AsRef<Path>) -> Result<PluginConfig, PluginConfigError> {
-    parse_plugin_config(&dir.as_ref().join("config.toml"))
+/// Read one Diple config snapshot from `<dir>/config.toml`.
+pub fn app_config_in(dir: impl AsRef<Path>) -> Result<AppConfig, AppConfigError> {
+    parse_app_config(&dir.as_ref().join("config.toml"))
 }
 
-fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
+fn parse_app_config(path: &Path) -> Result<AppConfig, AppConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(PluginConfig::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(AppConfig::default()),
         Err(error) => {
-            return Err(PluginConfigError::new(path, format!("read failed: {error}")));
+            return Err(AppConfigError::new(path, format!("read failed: {error}")));
         }
     };
     let table: toml::Table = text.parse().map_err(|error: toml::de::Error| {
-        PluginConfigError::new(path, format!("syntax error: {}", error.message()))
+        AppConfigError::new(path, format!("syntax error: {}", error.message()))
     })?;
-    if let Some(key) = table.keys().find(|key| !PLUGIN_CONFIG_KEYS.contains(&key.as_str())) {
-        return Err(unknown_key_error(path, key, &PLUGIN_CONFIG_KEYS.join(", ")));
+    if let Some(key) = table.keys().find(|key| !APP_CONFIG_KEYS.contains(&key.as_str())) {
+        return Err(unknown_key_error(path, key, &APP_CONFIG_KEYS.join(", ")));
     }
 
-    let mut config = PluginConfig::default();
+    let mut config = AppConfig::default();
     if let Some(value) = table.get("theme") {
         let theme = string_value(path, "theme", value, "a built-in theme name")?;
         if !crate::theme::is_known(theme) {
-            return Err(PluginConfigError::new(
+            return Err(AppConfigError::new(
                 path,
                 format!("invalid value for `theme`: {theme:?}; expected a built-in theme name"),
             ));
@@ -355,25 +284,16 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         theme.clone_into(&mut config.theme);
     }
     if let Some(value) = table.get("default_scope") {
-        config.default_scope = match string_value(
-            path,
-            "default_scope",
-            value,
-            "one of uncommitted, branch, last-turn",
-        )? {
-            "uncommitted" => crate::model::Scope::Uncommitted,
-            "branch" => crate::model::Scope::Branch,
-            "last-turn" => crate::model::Scope::LastTurn,
-            // `commits` needs a pick the pane does not yet hold, so it is not a start scope
-            // and falls to the error.
-            _ => {
-                return Err(value_error(
-                    path,
-                    "default_scope",
-                    "one of uncommitted, branch, last-turn",
-                ));
-            }
-        };
+        config.default_scope =
+            match string_value(path, "default_scope", value, "one of uncommitted, branch")? {
+                "uncommitted" => crate::model::Scope::Uncommitted,
+                "branch" => crate::model::Scope::Branch,
+                // `commits` needs a pick the pane does not yet hold, so it is not a start scope
+                // and falls to the error.
+                _ => {
+                    return Err(value_error(path, "default_scope", "one of uncommitted, branch"));
+                }
+            };
     }
     if let Some(value) = table.get("navigator_position") {
         config.navigator_position = match string_value(
@@ -394,38 +314,6 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
                 ));
             }
         };
-    }
-    if let Some(value) = table.get("toggle_placement") {
-        config.toggle_placement = match string_value(
-            path,
-            "toggle_placement",
-            value,
-            "one of split, overlay, zoomed, tab",
-        )? {
-            "split" => TogglePlacement::Split,
-            "overlay" => TogglePlacement::Overlay,
-            "zoomed" => TogglePlacement::Zoomed,
-            "tab" => TogglePlacement::Tab,
-            _ => {
-                return Err(value_error(
-                    path,
-                    "toggle_placement",
-                    "one of split, overlay, zoomed, tab",
-                ));
-            }
-        };
-    }
-    if let Some(value) = table.get("toggle_direction") {
-        config.toggle_direction =
-            match string_value(path, "toggle_direction", value, "one of right, down")? {
-                "right" => ToggleDirection::Right,
-                "down" => ToggleDirection::Down,
-                _ => return Err(value_error(path, "toggle_direction", "one of right, down")),
-            };
-    }
-    if let Some(value) = table.get("auto_open") {
-        config.auto_open =
-            value.as_bool().ok_or_else(|| value_error(path, "auto_open", "a boolean"))?;
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -465,7 +353,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         if let Some((owner, _)) =
             host_keys[..index].iter().find(|(_, earlier)| earlier.as_ref() == Some(value))
         {
-            return Err(PluginConfigError::new(
+            return Err(AppConfigError::new(
                 path,
                 format!(
                     "invalid value for `{key}`; expected a hostname no other forge recognizes, but {value:?} is already `{owner}`"
@@ -513,7 +401,7 @@ fn parse_key(text: &str) -> Option<crate::keymap::Key> {
 fn parse_keybindings(
     path: &Path,
     value: &toml::Value,
-) -> Result<crate::keymap::Keymap, PluginConfigError> {
+) -> Result<crate::keymap::Keymap, AppConfigError> {
     use crate::keymap::{Action, Keymap};
     let Some(entries) = value.as_table() else {
         return Err(value_error(path, "keybindings", "a table of action bindings"));
@@ -536,7 +424,7 @@ fn parse_keybindings(
         if let Some((_, first_name)) =
             names_by_action.iter().find(|(bound, _): &&(Action, &str)| *bound == action)
         {
-            return Err(PluginConfigError::new(
+            return Err(AppConfigError::new(
                 path,
                 format!(
                     "invalid value for `keybindings`: `{first_name}` and `{name}` name the same action"
@@ -565,7 +453,7 @@ fn parse_keybindings(
         overrides.push((action, keys));
     }
     Keymap::resolve(&overrides).map_err(|detail| {
-        PluginConfigError::new(path, format!("invalid value for `keybindings`: {detail}"))
+        AppConfigError::new(path, format!("invalid value for `keybindings`: {detail}"))
     })
 }
 
@@ -574,17 +462,17 @@ fn string_value<'a>(
     key: &str,
     value: &'a toml::Value,
     expected: &str,
-) -> Result<&'a str, PluginConfigError> {
+) -> Result<&'a str, AppConfigError> {
     value.as_str().ok_or_else(|| value_error(path, key, expected))
 }
 
-fn value_error(path: &Path, key: &str, expected: &str) -> PluginConfigError {
-    PluginConfigError::new(path, format!("invalid value for `{key}`; expected {expected}"))
+fn value_error(path: &Path, key: &str, expected: &str) -> AppConfigError {
+    AppConfigError::new(path, format!("invalid value for `{key}`; expected {expected}"))
 }
 
 /// The one `CFG-WHOLE-FILE` unknown-key grammar, shared by the top-level table and `[keybindings]`.
-fn unknown_key_error(path: &Path, key: &str, options: &str) -> PluginConfigError {
-    PluginConfigError::new(path, format!("unknown key {key:?}; expected one of {options}"))
+fn unknown_key_error(path: &Path, key: &str, options: &str) -> AppConfigError {
+    AppConfigError::new(path, format!("unknown key {key:?}; expected one of {options}"))
 }
 
 /// The first `{` in `command` that opens neither `{file}` nor `{line}`.
@@ -609,11 +497,7 @@ fn unknown_placeholder(command: &str) -> Option<String> {
 /// Parse one self-hosted forge key: a bare hostname naming no built-in forge host — a
 /// hostname is recognized by at most one forge. The built-in set has
 /// one authority, `git::forge_for_host`, asked here with no self-hosted keys.
-fn parse_forge_host(
-    path: &Path,
-    key: &str,
-    value: &toml::Value,
-) -> Result<String, PluginConfigError> {
+fn parse_forge_host(path: &Path, key: &str, value: &toml::Value) -> Result<String, AppConfigError> {
     let expected = "a bare hostname outside the built-in forge hosts";
     let host = string_value(path, key, value, expected)?;
     let lower = host.to_ascii_lowercase();
@@ -642,20 +526,9 @@ pub(crate) fn valid_host_syntax(host: &str) -> bool {
     })
 }
 
-/// Print the shared normalized configuration for the plugin action script. This is its own
-/// entrypoint (`--resolve-plugin-config`), so it resolves the config directory itself — and
-/// initializes the log itself, or the herdr-side diagnostics of a failed lookup would be
-/// dropped on the one path that exercises the CLI fallback from a plain shell.
-pub fn print_plugin_config() -> Result<(), PluginConfigError> {
-    crate::log::init();
-    let dir = resolve_config_dir(crate::herdr::plugin_config_dir);
-    println!("{}", plugin_config(dir.as_deref())?.to_json());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Config, NavigatorPosition, PluginConfig, ToggleDirection, TogglePlacement};
+    use super::{AppConfig, Config, NavigatorPosition};
     use crate::keymap::KeyCode;
     use crate::model::Scope;
     use std::time::Duration;
@@ -686,47 +559,24 @@ mod tests {
     }
 
     #[test]
-    fn config_dir_prefers_the_env_and_falls_back_to_the_cli() {
-        use std::path::PathBuf;
-        // Env set: the CLI is never asked.
-        let dir =
-            super::config_dir_from(Some("/tmp/cfg".into()), || panic!("cli asked despite the env"));
-        assert_eq!(dir, Some(PathBuf::from("/tmp/cfg")));
-        // Env unset: the CLI's directory is used. An empty env value names no directory
-        // and falls through the same way.
-        let dir = super::config_dir_from(None, || Some("/tmp/from-cli".to_string()));
-        assert_eq!(dir, Some(PathBuf::from("/tmp/from-cli")));
-        let dir = super::config_dir_from(Some("".into()), || Some("/tmp/from-cli".to_string()));
-        assert_eq!(dir, Some(PathBuf::from("/tmp/from-cli")));
-        // An empty CLI answer names no directory either — `PathBuf::from("")` would read
-        // `./config.toml` from the repo under review.
-        assert_eq!(super::config_dir_from(None, || Some(String::new())), None);
-        // Neither resolves — herdr absent or refusing: no config directory.
-        assert_eq!(super::config_dir_from(None, || None), None);
-    }
-
-    #[test]
     fn no_config_directory_reads_no_file_and_uses_defaults() {
-        assert_eq!(super::plugin_config(None).unwrap(), PluginConfig::default());
+        assert_eq!(super::app_config(None).unwrap(), AppConfig::default());
     }
 
     #[test]
     fn missing_file_uses_all_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(super::plugin_config_in(dir.path()).unwrap(), PluginConfig::default());
+        assert_eq!(super::app_config_in(dir.path()).unwrap(), AppConfig::default());
     }
 
     #[test]
     fn omitted_keys_keep_their_defaults() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "theme = \"gruvbox\"\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.theme(), "gruvbox");
         assert_eq!(config.default_scope(), Scope::Uncommitted);
         assert_eq!(config.navigator_position(), NavigatorPosition::Right);
-        assert_eq!(config.toggle_placement(), TogglePlacement::Split);
-        assert_eq!(config.toggle_direction(), ToggleDirection::Right);
-        assert!(config.auto_open());
         assert_eq!(config.github_host(), None);
     }
 
@@ -737,22 +587,16 @@ mod tests {
             dir.path().join("config.toml"),
             concat!(
                 "theme = \"tokyo-night\"\n",
-                "default_scope = \"last-turn\"\n",
+                "default_scope = \"branch\"\n",
                 "navigator_position = \"bottom\"\n",
-                "toggle_placement = \"overlay\"\n",
-                "toggle_direction = \"down\"\n",
-                "auto_open = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
             ),
         )
         .unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.theme(), "tokyo-night");
-        assert_eq!(config.default_scope(), Scope::LastTurn);
+        assert_eq!(config.default_scope(), Scope::Branch);
         assert_eq!(config.navigator_position(), NavigatorPosition::Bottom);
-        assert_eq!(config.toggle_placement(), TogglePlacement::Overlay);
-        assert_eq!(config.toggle_direction(), ToggleDirection::Down);
-        assert!(!config.auto_open());
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
 
@@ -761,7 +605,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "editor = \"code -g {file}:{line}\"\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.editor(), Some("code -g {file}:{line}"));
 
         assert_eq!(config.to_json()["editor"], "code -g {file}:{line}");
@@ -771,13 +615,13 @@ mod tests {
         // for anyone who spelled their editor the short way.
         for value in ["vim", "myed --at {line}"] {
             std::fs::write(&path, format!("editor = \"{value}\"\n")).unwrap();
-            let config = super::plugin_config_in(dir.path()).expect(value);
+            let config = super::app_config_in(dir.path()).expect(value);
             assert_eq!(config.editor(), Some(value));
         }
 
         // Unset, the key resolves to null and the environment supplies the editor instead
         std::fs::write(&path, "theme = \"tokyo-night\"\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.editor(), None);
         assert!(config.to_json()["editor"].is_null());
     }
@@ -787,20 +631,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "theme = \"gruvbox\"\npoll = 500\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains(path.to_str().unwrap()));
         assert!(error.contains("unknown key \"poll\""));
 
         // The retired `base_branches` key fails like any unknown key: the base is a picked,
         // per-repo choice now, never configuration.
         std::fs::write(&path, "base_branches = [\"dev\"]\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("unknown key \"base_branches\""));
 
         std::fs::write(&path, "theme = [\n").unwrap();
-        assert!(
-            super::plugin_config_in(dir.path()).unwrap_err().to_string().contains("syntax error")
-        );
+        assert!(super::app_config_in(dir.path()).unwrap_err().to_string().contains("syntax error"));
     }
 
     #[test]
@@ -808,13 +650,10 @@ mod tests {
         let cases = [
             ("theme = \"unknown\"\n", "`theme`"),
             ("default_scope = \"weekly\"\n", "`default_scope`"),
-            ("default_scope = \"last turn\"\n", "`default_scope`"),
+            ("default_scope = \"session\"\n", "`default_scope`"),
             // `commits` is never a start scope: the pane holds no pick yet.
             ("default_scope = \"commits\"\n", "`default_scope`"),
             ("navigator_position = \"center\"\n", "`navigator_position`"),
-            ("toggle_placement = \"left\"\n", "`toggle_placement`"),
-            ("toggle_direction = \"left\"\n", "`toggle_direction`"),
-            ("auto_open = \"yes\"\n", "`auto_open`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),
@@ -838,7 +677,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         for (text, key) in cases {
             std::fs::write(&path, text).unwrap();
-            let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+            let error = super::app_config_in(dir.path()).unwrap_err().to_string();
             assert!(error.contains(key), "{text}: {error}");
             assert!(error.contains("expected"), "{text}: {error}");
         }
@@ -849,7 +688,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "gitlab_host = \"Git.Corp.EXAMPLE\"\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.gitlab_host(), Some("git.corp.example"));
 
         // The same hostname under two forge keys is an invalid file (CFG-WHOLE-FILE): a
@@ -859,7 +698,7 @@ mod tests {
             "github_host = \"code.corp.example\"\ngitlab_host = \"code.corp.example\"\n",
         )
         .unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("gitlab_host"), "{error}");
         assert!(error.contains("github_host"), "{error}");
         assert!(error.contains("code.corp.example"), "{error}");
@@ -871,7 +710,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "azure_devops_host = \"Tfs.Corp.EXAMPLE\"\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.azure_devops_host(), Some("tfs.corp.example"));
         assert_eq!(config.forge_hosts().azure_devops, Some("tfs.corp.example"));
 
@@ -888,7 +727,7 @@ mod tests {
                 format!("{first} = \"code.corp.example\"\n{second} = \"code.corp.example\"\n"),
             )
             .unwrap();
-            let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+            let error = super::app_config_in(dir.path()).unwrap_err().to_string();
             assert!(error.contains(first), "{first}/{second}: {error}");
             assert!(error.contains(second), "{first}/{second}: {error}");
             assert!(error.contains("code.corp.example"), "{first}/{second}: {error}");
@@ -900,7 +739,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "github_host = \"github.com-work\"\n")
             .unwrap();
-        let config = super::plugin_config_in(dir.path()).expect("valid literal Enterprise host");
+        let config = super::app_config_in(dir.path()).expect("valid literal Enterprise host");
         assert_eq!(config.github_host(), Some("github.com-work"));
     }
 
@@ -913,7 +752,7 @@ mod tests {
             "[keybindings]\ncomment = [\"c\", \"ㅊ\"]\nsend = [\"x\"]\n",
         )
         .unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         let keymap = config.keymap();
         assert_eq!(keymap.action_for(Key::plain('ㅊ')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
@@ -931,14 +770,14 @@ mod tests {
 
         // The default `find` chord resolves and serializes in config syntax.
         std::fs::write(&path, "theme = \"catppuccin\"\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::ctrl('f')), Some(Action::Find));
         let bindings = config.to_json()["keybindings"].as_object().unwrap().clone();
         assert_eq!(bindings["find"], serde_json::json!(["ctrl+f"]));
 
         // A rebind to another chord takes, and the old default frees.
         std::fs::write(&path, "[keybindings]\nfind = [\"alt+x\"]\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(
             config.keymap().action_for(Key { ctrl: false, alt: true, code: KeyCode::Char('x') }),
             Some(Action::Find)
@@ -949,7 +788,7 @@ mod tests {
 
         // A malformed chord is an invalid value.
         std::fs::write(&path, "[keybindings]\nfind = [\"ctrl+\"]\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("`keybindings.find`") && error.contains("expected"), "{error}");
     }
 
@@ -960,7 +799,7 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         std::fs::write(&path, "[keybindings]\ncollapse = [\"h\", \"left\"]\n").unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain('h')), Some(Action::Collapse));
         assert_eq!(config.keymap().action_for(Key::named(KeyCode::Left)), Some(Action::Collapse));
         let json = config.to_json();
@@ -975,12 +814,12 @@ mod tests {
             .chain(resolved.iter().map(|(action, keys)| format!("{action} = {keys}\n")))
             .collect();
         std::fs::write(&path, toml).unwrap();
-        let reparsed = super::plugin_config_in(dir.path()).unwrap();
+        let reparsed = super::app_config_in(dir.path()).unwrap();
         assert_eq!(reparsed.to_json()["keybindings"], json["keybindings"]);
 
         // The display spelling of a named key is not the config spelling.
         std::fs::write(&path, "[keybindings]\npage-up = [\"PageUp\"]\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("`keybindings.page-up`") && error.contains("pageup"), "{error}");
     }
 
@@ -989,7 +828,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "[keybindings]\nexpand = [\"l\"]\n")
             .unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(
             error.contains("`expand`") && error.contains("`comments`") && error.contains('l'),
             "{error}"
@@ -1003,7 +842,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[keybindings]\nlist-wider = [\"+\"]\nlist-narrower = [\"-\"]\n")
             .unwrap();
-        let config = super::plugin_config_in(dir.path()).unwrap();
+        let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain('+')), Some(Action::NavigatorGrow));
         assert_eq!(config.keymap().action_for(Key::plain('-')), Some(Action::NavigatorShrink));
         let json = config.to_json();
@@ -1015,7 +854,7 @@ mod tests {
 
         std::fs::write(&path, "[keybindings]\nnavigator-grow = [\"g\"]\nlist-wider = [\"h\"]\n")
             .unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("same action"), "{error}");
         assert!(error.contains("navigator-grow") && error.contains("list-wider"), "{error}");
     }
@@ -1025,7 +864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "[keybindings]\npreview = [\"p\"]\n")
             .unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("`preview`") && error.contains("`navigator-position`"), "{error}");
         assert!(error.contains("p is bound"), "{error}");
     }
@@ -1048,7 +887,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         for entry in cases {
             std::fs::write(&path, format!("[keybindings]\n{entry}")).unwrap();
-            let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+            let error = super::app_config_in(dir.path()).unwrap_err().to_string();
             assert!(error.contains("`keybindings.comment`"), "{entry}: {error}");
             assert!(error.contains("expected"), "{entry}: {error}");
         }
@@ -1060,11 +899,11 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         std::fs::write(&path, "[keybindings]\ncomment = [\"v\"]\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("`comment`") && error.contains("`select`"), "{error}");
 
         std::fs::write(&path, "[keybindings]\ncomment = [\"c\", \"c\"]\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("bound twice") && error.contains("`comment`"), "{error}");
     }
 
@@ -1072,7 +911,7 @@ mod tests {
     fn unknown_action_is_an_unknown_key() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "[keybindings]\nfoo = [\"x\"]\n").unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("unknown key \"keybindings.foo\""), "{error}");
         assert!(error.contains("comment"), "the error lists the action names: {error}");
     }
@@ -1082,21 +921,18 @@ mod tests {
     fn unreadable_config_path_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("config.toml")).unwrap();
-        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        let error = super::app_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("read failed"));
         assert!(error.contains("config.toml"));
     }
 
     #[test]
     fn normalized_json_contains_every_key() {
-        let value = PluginConfig::default().to_json();
+        let value = AppConfig::default().to_json();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), super::PLUGIN_CONFIG_KEYS.len(), "one JSON key per config key");
+        assert_eq!(object.len(), super::APP_CONFIG_KEYS.len(), "one JSON key per config key");
         assert_eq!(object["default_scope"], "uncommitted");
         assert_eq!(object["navigator_position"], "right");
-        assert_eq!(object["toggle_placement"], "split");
-        assert_eq!(object["toggle_direction"], "right");
-        assert_eq!(object["auto_open"], true);
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(

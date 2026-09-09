@@ -4,13 +4,12 @@
 mod common;
 
 use common::{Repo, app_on, enter_tab};
-use herdr_reviewr::app::{App, BaseChoice, BasePicker, BaseProbe, Focus, Mode, Tab};
-use herdr_reviewr::config::NavigatorPosition;
-use herdr_reviewr::herdr::AgentChoice;
-use herdr_reviewr::keymap::Keymap;
-use herdr_reviewr::model::Scope;
-use herdr_reviewr::ui::{self, HeaderHit};
-use herdr_reviewr::{handle_key, handle_mouse};
+use diple::app::{App, BaseChoice, BasePicker, BaseProbe, Focus, Mode, Tab};
+use diple::config::NavigatorPosition;
+use diple::keymap::Keymap;
+use diple::model::Scope;
+use diple::ui::{self, HeaderHit};
+use diple::{handle_key, handle_mouse};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -83,16 +82,16 @@ fn composing(app: &mut App) {
 fn invalid_config_replaces_the_entire_pane_with_its_error() {
     let mut app = edited_app();
     app.set_config_error(
-        "config /tmp/reviewr/config.toml: invalid value for `theme`; expected a built-in theme name"
+        "config /tmp/diple/config.toml: invalid value for `theme`; expected a built-in theme name"
             .to_string(),
     );
 
     let out = render(&app);
 
-    assert!(out.contains("config /tmp/reviewr/config.toml"));
+    assert!(out.contains("config /tmp/diple/config.toml"));
     assert!(out.contains("expected a built-in theme name"));
     assert!(out.contains("The config reloads automatically."));
-    assert!(!out.contains("Changes"), "normal reviewr chrome must be hidden");
+    assert!(!out.contains("Changes"), "normal Diple chrome must be hidden");
 }
 
 #[test]
@@ -282,7 +281,7 @@ fn the_fold_hint_names_the_expand_binding() {
     // (a hint shows the action's first bound key).
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), "[keybindings]\nexpand = [\"x\"]\n").unwrap();
-    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.set_app_config(diple::config::app_config_in(dir.path()).unwrap());
     let out = render(&app);
     assert!(out.contains("x expand"), "the rebound key names the hint:\n{out}");
     assert!(!out.contains("→ expand"), "the freed arrow leaves the hint");
@@ -317,6 +316,41 @@ fn the_file_list_renders_as_a_directory_tree() {
     assert!(files_pane.contains("app.rs") && files_pane.contains("ui.rs"), "files by basename");
     assert!(!files_pane.contains("src/app.rs"), "a grouped file is not shown by full path");
     assert!(files_pane.contains("Cargo.toml"), "the top-level file shows too");
+}
+
+#[test]
+fn partially_staged_paths_render_in_both_named_sections() {
+    let r = Repo::init();
+    r.write("same.rs", "base\n");
+    r.commit_all("init");
+    r.write("same.rs", "base\nstaged\n");
+    r.git(&["add", "same.rs"]);
+    r.write("same.rs", "base\nstaged\nworking\n");
+    let app = app_on(&r);
+
+    let out = render(&app);
+    let files_pane = right_column(&out, 70);
+    assert!(out.contains("Staged Changes 1"), "{out}");
+    assert!(out.contains("Changes 1"), "{out}");
+    assert_eq!(
+        files_pane.matches("same.rs").count(),
+        2,
+        "one path is independently reviewable on both sides:\n{files_pane}"
+    );
+}
+
+#[test]
+fn send_confirmation_names_the_stdout_boundary() {
+    let mut app = edited_app();
+    composing(&mut app);
+    app.input_push('x');
+    app.submit_comment();
+    app.begin_send();
+
+    let out = render(&app);
+    assert!(out.contains("send review"), "{out}");
+    assert!(out.contains("Write 1 comment to stdout and exit?"), "{out}");
+    assert!(out.contains("Press Enter to send, Esc to keep reviewing."), "{out}");
 }
 
 #[test]
@@ -545,12 +579,14 @@ fn the_diff_cursor_row_is_marked_from_either_pane() {
 
 #[test]
 fn the_selected_file_row_fills_with_the_shared_selection_color() {
-    let app = edited_app(); // one file, file_cursor = 0, Files focused
+    let app = edited_app(); // one file below the uncommitted section header, Files focused
     let buf = render_buffer(&app);
     // Files pane: right 32% of 140 cols; its border is at y=1, first content row at y=2.
     let files_x0 = 140 - 140 * 32 / 100 + 1;
-    let selected =
-        (files_x0..139).filter(|&x| buf.cell((x, 2)).is_some_and(|c| c.bg == SELECTION_BG)).count();
+    let selected_y = 2 + u16::try_from(app.file_cursor).unwrap();
+    let selected = (files_x0..139)
+        .filter(|&x| buf.cell((x, selected_y)).is_some_and(|c| c.bg == SELECTION_BG))
+        .count();
     assert!(selected > 10, "the selected file row fills wide with surface2: {selected} cells");
 }
 
@@ -718,7 +754,7 @@ fn a_status_too_long_to_paint_never_costs_the_row_the_actions_that_fit() {
     app.input_push('n');
     app.submit_comment(); // a written comment adds `s send 1` to row 1
 
-    // A herdr failure is the longest line the status ever carries. Where the row has no room to
+    // A long git failure is representative of the widest status the row may carry. Where it has no room to
     // paint any of it, the status must cost nothing: the row falls back to exactly what it shows
     // with no status at all. Reserving room for a message that then drops would spend the width
     // twice and paint neither.
@@ -741,7 +777,7 @@ fn the_footer_shows_the_sends_outcome_at_a_pane_width_by_yielding_the_cursor_act
     app.input_push('n');
     app.submit_comment(); // a written comment adds `s send 1` to row 1
 
-    // The status is the only answer `s` gives, and a reviewr pane is around 40 columns wide, so
+    // The status is the only answer `s` gives, and a Diple pane can be around 40 columns wide, so
     // the cursor's actions yield to it: the `?` panel repeats every action and nothing repeats the
     // status.
     app.status = "no agent here — copy to the clipboard instead".to_string();
@@ -816,10 +852,10 @@ fn the_expansion_aligns_row_one_into_the_labeled_grid() {
     assert_eq!(at(&go_line, "go"), at(&move_line, "move"), "labels share a gutter column");
     assert_eq!(
         at(&do_line, "c comment"),
-        at(&go_line, "u/b/t"),
+        at(&go_line, "u/b/g"),
         "the primary aligns under the same column as the band keys"
     );
-    assert_eq!(at(&go_line, "u/b/t"), at(&move_line, "j k"), "band keys align in one column");
+    assert_eq!(at(&go_line, "u/b/g"), at(&move_line, "j k"), "band keys align in one column");
 }
 
 #[test]
@@ -867,8 +903,8 @@ fn the_expansion_caps_so_the_body_keeps_its_rows() {
 
 #[test]
 fn the_pr_footer_keeps_the_open_action_when_the_state_line_is_long() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{Check, CheckStatus, Merge, PrSnapshot, PrView, Sync};
+    use diple::app::Tab;
+    use diple::forge::{Check, CheckStatus, Merge, PrSnapshot, PrView, Sync};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -889,8 +925,8 @@ fn the_pr_footer_keeps_the_open_action_when_the_state_line_is_long() {
 
 #[test]
 fn pr_header_names_the_resolved_branch_and_marks_a_fork() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::app::Tab;
+    use diple::forge::{PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -932,8 +968,8 @@ fn pr_header_names_the_resolved_branch_and_marks_a_fork() {
 
 #[test]
 fn pr_empty_states_are_calm() {
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::forge::PrView;
+    use diple::app::Tab;
+    use diple::forge::PrView;
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -980,7 +1016,7 @@ fn the_footer_shows_an_editor_failure_from_either_pane() {
     let footer = footer_line(&render(&app));
     assert!(footer.contains("editor failed"), "on the read pane:\n{footer}");
 
-    app.focus = herdr_reviewr::app::Focus::Files;
+    app.focus = diple::app::Focus::Files;
     let footer = footer_line(&render(&app));
     assert!(footer.contains("editor failed"), "and on the navigator:\n{footer}");
 
@@ -1248,7 +1284,7 @@ fn pr_focus_border_tracks_tab_between_navigator_and_read_pane() {
 
 #[test]
 fn a_zero_height_pr_navigator_does_not_consume_selection_reveal() {
-    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    use diple::forge::{Comment, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1269,7 +1305,7 @@ fn a_zero_height_pr_navigator_does_not_consume_selection_reveal() {
 
 #[test]
 fn a_loading_pr_navigator_does_not_consume_selection_reveal() {
-    use herdr_reviewr::forge::{Check, CheckStatus, Comment, PrSnapshot, PrView};
+    use diple::forge::{Check, CheckStatus, Comment, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1344,48 +1380,8 @@ fn open_list_renders_the_comments_overlay() {
 }
 
 #[test]
-fn last_turn_without_an_agent_says_the_worktree_is_empty() {
-    // owns when membership counts as observed; owns the
-    // wording. Only a sample that found no member may say the worktree is empty.
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    let mut app = App::new(r.path_buf(), Scope::LastTurn, None);
-    app.reload().unwrap();
-    app.sync_agents_present(Some(false));
-    let out = render(&app);
-    assert!(out.contains("[last turn]"), "the scope chip reads last turn");
-    assert!(out.contains("no agent works here"), "the empty-worktree state shows");
-}
-
-#[test]
-fn last_turn_with_an_agent_and_no_turn_yet_waits_for_the_first() {
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    let mut app = App::new(r.path_buf(), Scope::LastTurn, None);
-    app.reload().unwrap();
-    app.sync_agents_present(Some(true));
-    let out = render(&app);
-    assert!(out.contains("waiting for the first turn"), "the pre-turn state shows");
-}
-
-#[test]
-fn last_turn_before_the_first_sample_waits_rather_than_asserting_emptiness() {
-    // The pre-poll frame has observed nothing, so it may wait but not claim the worktree
-    // is empty — stale is allowed, wrong is not (Continuity).
-    let r = Repo::init();
-    r.write("a.rs", "a\n");
-    r.commit_all("init");
-    let mut app = App::new(r.path_buf(), Scope::LastTurn, None);
-    app.reload().unwrap();
-    let out = render(&app);
-    assert!(out.contains("waiting for the first turn"), "the unknown state waits");
-}
-
-#[test]
 fn all_files_tab_bar_footer_and_count_read_for_the_tab() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("a.rs", "one\n");
     r.commit_all("init");
@@ -1418,7 +1414,7 @@ fn all_files_tab_bar_footer_and_count_read_for_the_tab() {
 
 #[test]
 fn all_files_empty_pane_reads_select_a_file() {
-    use herdr_reviewr::app::Tab;
+    use diple::app::Tab;
     let r = Repo::init();
     r.write("src/a.rs", "x\n");
     r.write("src/b.rs", "y\n"); // two children so src/ is a real collapsed dir, not a folded file
@@ -1438,7 +1434,7 @@ fn renders_a_light_theme_without_panic() {
     // Driving the full render path with a derived light palette must not panic, and a Latte
     // color (the focused pane's blue border) reaches the painted buffer.
     let buf = render_buffer(&app);
-    let latte_blue = herdr_reviewr::theme::resolve(Some("catppuccin-latte")).palette.blue;
+    let latte_blue = diple::theme::resolve(Some("catppuccin-latte")).palette.blue;
     let painted = (0..40)
         .flat_map(|y| (0..140).map(move |x| (x, y)))
         .any(|(x, y)| buf.cell((x, y)).is_some_and(|c| c.fg == latte_blue));
@@ -1450,9 +1446,9 @@ fn rebound_app(keybindings: &str) -> App {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), format!("[keybindings]\n{keybindings}"))
         .unwrap();
-    let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
+    let config = diple::config::app_config_in(dir.path()).unwrap();
     let mut app = edited_app();
-    app.set_plugin_config(config);
+    app.set_app_config(config);
     app.focus = Focus::Diff;
     app
 }
@@ -1470,7 +1466,7 @@ fn hints_show_the_first_bound_key() {
 
 /// The header columns `hit_header` maps to `tab` under `keymap`, scanned instead of hardcoded
 /// so the tests survive changes to the label text and gaps.
-fn tab_hit_cols(app: &App, keymap: &herdr_reviewr::keymap::Keymap, tab: Tab) -> Vec<u16> {
+fn tab_hit_cols(app: &App, keymap: &diple::keymap::Keymap, tab: Tab) -> Vec<u16> {
     let area = Rect::new(0, 0, 140, 40);
     (0..140)
         .filter(|&c| ui::hit_header(area, app, keymap, c, 0) == Some(HeaderHit::Tab(tab)))
@@ -1479,7 +1475,7 @@ fn tab_hit_cols(app: &App, keymap: &herdr_reviewr::keymap::Keymap, tab: Tab) -> 
 
 #[test]
 fn header_hits_use_the_frame_keymap_not_the_live_one() {
-    use herdr_reviewr::keymap::default_keymap;
+    use diple::keymap::default_keymap;
     // The live keymap has a wide tab-changes hint, shifting every span right by one column.
     let app = rebound_app("tab-changes = [\"ㅊ\"]\n");
     for tab in [Tab::Changes, Tab::AllFiles, Tab::Pr] {
@@ -1558,16 +1554,13 @@ fn a_deleted_markdown_file_offers_no_preview_in_the_footer() {
 
 #[test]
 fn pr_bodies_render_as_markdown_and_the_description_row_pins_first() {
-    use herdr_reviewr::forge::{Comment, CommentKind, PrSnapshot, PrView};
+    use diple::forge::{Comment, CommentKind, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
     let mut app = app_on(&r);
     app.set_tab(Tab::Pr).unwrap();
-    let place = herdr_reviewr::forge::FindingPlace::from_anchor(
-        "x.rs:1",
-        Some(herdr_reviewr::model::Side::New),
-    );
+    let place = diple::forge::FindingPlace::from_anchor("x.rs:1", Some(diple::model::Side::New));
     let finding = Comment {
         kind: CommentKind::Finding,
         author: "codex".into(),
@@ -1611,7 +1604,7 @@ fn pr_bodies_render_as_markdown_and_the_description_row_pins_first() {
 
 #[test]
 fn a_finding_range_paints_as_diff_rows() {
-    use herdr_reviewr::forge::{Comment, CommentKind, PrSnapshot, PrView};
+    use diple::forge::{Comment, CommentKind, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1635,10 +1628,7 @@ fn a_finding_range_paints_as_diff_rows() {
         "x".repeat(80),
     );
     let finding = |anchor: &str, body: &str| {
-        let place = herdr_reviewr::forge::FindingPlace::from_anchor(
-            anchor,
-            Some(herdr_reviewr::model::Side::New),
-        );
+        let place = diple::forge::FindingPlace::from_anchor(anchor, Some(diple::model::Side::New));
         Comment {
             kind: CommentKind::Finding,
             author: "codex".into(),
@@ -1690,7 +1680,7 @@ fn a_finding_range_paints_as_diff_rows() {
 
 #[test]
 fn pr_nav_clicks_map_the_description_and_comment_rows() {
-    use herdr_reviewr::forge::{Check, CheckStatus, Comment, PrSnapshot, PrView};
+    use diple::forge::{Check, CheckStatus, Comment, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1723,7 +1713,7 @@ fn pr_nav_clicks_map_the_description_and_comment_rows() {
 
 #[test]
 fn pr_navigator_scroll_is_independent_and_preserved() {
-    use herdr_reviewr::forge::{Check, CheckStatus, Comment, PrSnapshot, PrView};
+    use diple::forge::{Check, CheckStatus, Comment, PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1768,7 +1758,7 @@ fn pr_navigator_scroll_is_independent_and_preserved() {
             area,
             &[],
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
     }
@@ -1787,7 +1777,7 @@ fn pr_navigator_scroll_is_independent_and_preserved() {
             area,
             &[],
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
     }
@@ -1824,7 +1814,7 @@ fn pr_navigator_scroll_is_independent_and_preserved() {
             area,
             &[],
             &keymap,
-            &herdr_reviewr::export::Clipboard,
+            &diple::export::Clipboard,
         )
         .unwrap();
     }
@@ -1852,7 +1842,7 @@ fn pr_navigator_scroll_is_independent_and_preserved() {
 
 #[test]
 fn the_refresh_glyph_lives_in_the_tab_strip_not_the_content() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::forge::{PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1887,7 +1877,7 @@ fn the_refresh_glyph_lives_in_the_tab_strip_not_the_content() {
 
 #[test]
 fn a_retry_notice_stays_visible_above_a_scrolled_pr_body() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::forge::{PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1913,8 +1903,8 @@ fn a_retry_notice_stays_visible_above_a_scrolled_pr_body() {
 
 #[test]
 fn a_gitlab_repository_renders_merge_request_nouns_and_remedies() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
-    use herdr_reviewr::git::Forge;
+    use diple::forge::{PrSnapshot, PrView};
+    use diple::git::Forge;
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1944,7 +1934,7 @@ fn a_gitlab_repository_renders_merge_request_nouns_and_remedies() {
 
 #[test]
 fn an_unsupported_host_points_at_the_per_forge_host_keys() {
-    use herdr_reviewr::forge::PrView;
+    use diple::forge::PrView;
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1960,8 +1950,8 @@ fn an_unsupported_host_points_at_the_per_forge_host_keys() {
 
 #[test]
 fn an_azure_devops_repository_renders_pr_nouns_and_remedies() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
-    use herdr_reviewr::git::Forge;
+    use diple::forge::{PrSnapshot, PrView};
+    use diple::git::Forge;
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -1994,7 +1984,7 @@ fn an_azure_devops_repository_renders_pr_nouns_and_remedies() {
 
 #[test]
 fn a_short_narrow_pr_pane_keeps_the_retry_action_and_one_body_row() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::forge::{PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -2002,10 +1992,7 @@ fn a_short_narrow_pr_pane_keeps_the_retry_action_and_one_body_row() {
     app.set_tab(Tab::Pr).unwrap();
     app.pr =
         PrView::Pr(Box::new(PrSnapshot { body: "steady body".into(), ..common::pr_snapshot() }));
-    app.apply_pr(PrView::NotAuthed(
-        herdr_reviewr::git::Forge::GitHub,
-        "github.example.com".to_string(),
-    ));
+    app.apply_pr(PrView::NotAuthed(diple::git::Forge::GitHub, "github.example.com".to_string()));
 
     let out = dump(&render_size(&app, 30, 7));
     assert!(out.contains("Not signed"), "the failure state remains visible:\n{out}");
@@ -2015,7 +2002,7 @@ fn a_short_narrow_pr_pane_keeps_the_retry_action_and_one_body_row() {
 
 #[test]
 fn markdown_links_paint_click_regions_and_the_guard_gates_them() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::forge::{PrSnapshot, PrView};
     let r = Repo::init();
     r.write("x.rs", "y\n");
     r.commit_all("init");
@@ -2092,7 +2079,7 @@ the target body
 
 #[test]
 fn a_body_that_fits_the_pane_shows_no_scrollbar() {
-    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    use diple::forge::{PrSnapshot, PrView};
     use std::fmt::Write as _;
     let r = Repo::init();
     r.write("x.rs", "y\n");
@@ -2186,7 +2173,7 @@ fn an_uppercase_unicode_anchor_still_finds_its_heading() {
 
 #[test]
 fn an_anchor_in_a_comment_body_jumps_past_the_snippet_offset() {
-    use herdr_reviewr::forge::{Comment, CommentKind, PrSnapshot, PrView};
+    use diple::forge::{Comment, CommentKind, PrSnapshot, PrView};
     use std::fmt::Write as _;
     let mut body = String::from("jump [go](#target)\n\n");
     for i in 0..60 {
@@ -2204,9 +2191,9 @@ fn an_anchor_in_a_comment_body_jumps_past_the_snippet_offset() {
             author: "codex".into(),
             author_is_bot: true,
             anchor: "x.rs:1".into(),
-            place: Some(herdr_reviewr::forge::FindingPlace::from_anchor(
+            place: Some(diple::forge::FindingPlace::from_anchor(
                 "x.rs:1",
-                Some(herdr_reviewr::model::Side::New),
+                Some(diple::model::Side::New),
             )),
             body,
             snippet: Some("-    old\n+    new".into()),
@@ -2264,11 +2251,11 @@ fn the_find_band_and_match_highlight_paint() {
 mod search_screen_render {
     use super::{common, dump, render, render_size};
     use common::{Repo, app_on, enter_tab};
-    use herdr_reviewr::app::{App, Mode, Tab};
-    use herdr_reviewr::keymap::default_keymap;
-    use herdr_reviewr::land_search_completion;
-    use herdr_reviewr::search::{CodeHit, FileHit, SearchCompletion, SearchOutcome, SearchResults};
-    use herdr_reviewr::{handle_key, handle_mouse, ui};
+    use diple::app::{App, Mode, Tab};
+    use diple::keymap::default_keymap;
+    use diple::land_search_completion;
+    use diple::search::{CodeHit, FileHit, SearchCompletion, SearchOutcome, SearchResults};
+    use diple::{handle_key, handle_mouse, ui};
     use ratatui::crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -2430,15 +2417,8 @@ mod search_screen_render {
                 row,
                 modifiers: KeyModifiers::NONE,
             };
-            handle_mouse(
-                app,
-                event,
-                AREA,
-                &[],
-                default_keymap(),
-                &herdr_reviewr::export::Clipboard,
-            )
-            .unwrap();
+            handle_mouse(app, event, AREA, &[], default_keymap(), &diple::export::Clipboard)
+                .unwrap();
         };
 
         // A click on an unpicked row picks it; a second click opens it.
@@ -2463,18 +2443,11 @@ mod search_screen_render {
             row: band_y,
             modifiers: KeyModifiers::NONE,
         };
-        handle_mouse(
-            &mut app,
-            event,
-            AREA,
-            &[],
-            default_keymap(),
-            &herdr_reviewr::export::Clipboard,
-        )
-        .unwrap();
+        handle_mouse(&mut app, event, AREA, &[], default_keymap(), &diple::export::Clipboard)
+            .unwrap();
         assert_eq!(
             app.search.as_ref().unwrap().search_mode,
-            herdr_reviewr::app::SearchMode::Code,
+            diple::app::SearchMode::Code,
             "a chip click flips the mode"
         );
     }
@@ -2743,11 +2716,11 @@ mod search_screen_render {
 mod search_row_emphasis {
     use super::{common, dump, render_size};
     use common::{Repo, app_on, enter_tab};
-    use herdr_reviewr::app::Tab;
-    use herdr_reviewr::handle_key;
-    use herdr_reviewr::keymap::default_keymap;
-    use herdr_reviewr::land_search_completion;
-    use herdr_reviewr::search::{CodeHit, SearchCompletion, SearchOutcome, SearchResults};
+    use diple::app::Tab;
+    use diple::handle_key;
+    use diple::keymap::default_keymap;
+    use diple::land_search_completion;
+    use diple::search::{CodeHit, SearchCompletion, SearchOutcome, SearchResults};
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::layout::Rect;
 
@@ -2886,219 +2859,6 @@ mod search_row_emphasis {
     }
 }
 
-// --- Agent picker ----------------------------------------------------
-
-fn agent_row(pane: &str, name: &str, state: &str, tab: &str) -> AgentChoice {
-    AgentChoice { pane_id: pane.into(), name: name.into(), state: state.into(), tab: tab.into() }
-}
-
-/// One saved comment on the first added line, so the picker has a count to title itself with.
-fn write_comment(app: &mut App, text: &str) {
-    composing(app);
-    app.input = text.to_string();
-    app.submit_comment();
-}
-
-/// An app with three comments and the picker open, matching the spec's mockup.
-fn picker_app() -> App {
-    let mut app = edited_app();
-    for text in ["one", "two", "three"] {
-        write_comment(&mut app, text);
-    }
-    app.open_picker(vec![
-        agent_row("w8:p1", "claude", "idle", "Grip Outreach"),
-        agent_row("w8:p2", "release-bot", "idle", "Grip Outreach Campaign"),
-        agent_row("w8:p3", "codex", "working", "3"),
-    ]);
-    app
-}
-
-#[test]
-fn the_last_sent_row_carries_its_tag_and_no_other_row_does() {
-    let mut app = edited_app();
-    write_comment(&mut app, "one");
-    // A prior send to release-bot arms the highlight there and tags the row, so the
-    // remembered default reads before `enter` fires it.
-    app.last_sent_pane = Some("w8:p2".to_string());
-    app.open_picker(vec![
-        agent_row("w8:p1", "claude", "idle", "1"),
-        agent_row("w8:p2", "release-bot", "idle", "2"),
-    ]);
-    assert_eq!(app.picker_cursor, 1, "the highlight arms on the last-sent agent");
-    let out = render(&app);
-
-    let tagged = out.lines().find(|l| l.contains("release-bot")).unwrap_or_default();
-    assert!(tagged.contains("· last used"), "the last-sent row is tagged: {tagged:?}");
-    let plain = out.lines().find(|l| l.contains("claude")).unwrap_or_default();
-    assert!(!plain.contains("last used"), "no other row is tagged: {plain:?}");
-}
-
-#[test]
-fn an_open_picker_dims_the_view_behind_it_but_never_the_footer() {
-    let mut app = edited_app();
-    write_comment(&mut app, "one");
-    let plain = render_buffer(&app);
-    app.open_picker(vec![
-        agent_row("w8:p1", "claude", "idle", "1"),
-        agent_row("w8:p2", "codex", "idle", "2"),
-    ]);
-    let dimmed = render_buffer(&app);
-
-    // The tab bar recedes toward the theme base while the picker is up.
-    // Locate a lettered header cell rather than assuming a column, so a header layout
-    // change cannot silently repoint the assertion.
-    let x = (0..plain.area.width)
-        .find(|&x| {
-            plain
-                .cell((x, 0))
-                .is_some_and(|c| c.symbol().chars().all(char::is_alphanumeric) && c.symbol() != " ")
-        })
-        .expect("a lettered cell in the tab bar");
-    let cell = |buf: &Buffer, x: u16, y: u16| buf.cell((x, y)).unwrap().clone();
-    assert_eq!(cell(&plain, x, 0).symbol(), cell(&dimmed, x, 0).symbol());
-    assert_ne!(cell(&plain, x, 0).fg, cell(&dimmed, x, 0).fg, "the header cell is scrimmed");
-
-    // The footer is the picker's own key bar, so its primary hint keeps full brightness.
-    let footer_y = dimmed.area.height - 1;
-    let bright =
-        (0..dimmed.area.width).any(|x| dimmed.cell((x, footer_y)).is_some_and(|c| c.fg == PEACH));
-    assert!(bright, "the footer's primary key hint stays at full brightness");
-}
-
-#[test]
-fn neither_popup_reaches_the_footer_that_advertises_its_keys() {
-    let mut app = edited_app();
-    for text in ["one", "two", "three"] {
-        write_comment(&mut app, text);
-    }
-    let rows = vec![
-        agent_row("w8:p1", "claude", "idle", "Grip Outreach"),
-        agent_row("w8:p2", "release-bot", "idle", "Grip Outreach Campaign"),
-    ];
-
-    // Both popups place through one rule, `body_popup`, so at every pane size the footer keeps
-    // naming the keys the popup is listening for — it is the only surface that does
-    for h in 8..=30u16 {
-        app.open_list();
-        let listed = dump(&render_size(&app, 44, h));
-        app.close_list();
-        app.open_picker(rows.clone());
-        let picked = dump(&render_size(&app, 44, h));
-        app.close_picker();
-
-        for (name, out) in [("comments list", listed), ("agent picker", picked)] {
-            let footer = out.lines().last().unwrap_or_default().to_string();
-            assert!(
-                footer.contains("esc"),
-                "the {name} popup covered the footer at height {h}:\n{out}"
-            );
-        }
-    }
-}
-
-#[test]
-fn the_picker_titles_the_count_and_aligns_the_dim_trail_in_one_column() {
-    let app = picker_app();
-    let out = render(&app);
-
-    assert!(out.contains("send 3 comments to"), "the title counts the comments:\n{out}");
-
-    let rows: Vec<&str> = out
-        .lines()
-        .filter(|l| l.contains("claude") || l.contains("release-bot") || l.contains("codex"))
-        .collect();
-    assert_eq!(rows.len(), 3, "one row per agent:\n{out}");
-
-    // The names pad to the widest, so every dim trail starts in the same column.
-    let starts: Vec<usize> = rows
-        .iter()
-        .map(|l| l.find("idle").or_else(|| l.find("working")).expect("a state on every row"))
-        .collect();
-    assert!(starts.windows(2).all(|w| w[0] == w[1]), "trails misaligned at {starts:?}:\n{out}");
-
-    // The tab trails behind the state, separated by the dim dot.
-    assert!(rows[0].contains("idle · Grip Outreach"), "{:?}", rows[0]);
-    assert!(rows[2].contains("working · 3"), "{:?}", rows[2]);
-}
-
-#[test]
-fn the_picker_numbers_only_the_rows_a_digit_key_can_reach() {
-    let mut app = edited_app();
-    write_comment(&mut app, "one");
-    let rows: Vec<AgentChoice> = (1..=11)
-        .map(|i| agent_row(&format!("w8:p{i}"), &format!("agent{i}"), "idle", "1"))
-        .collect();
-    app.open_picker(rows);
-    let out = render(&app);
-
-    for i in 1..=9 {
-        let row = out.lines().find(|l| l.contains(&format!("agent{i} "))).unwrap_or_default();
-        assert!(row.contains(&format!(" {i}  ")), "row {i} carries its digit: {row:?}");
-    }
-    // Rows past the ninth are reached by movement, so they carry no number to press.
-    let tenth = out.lines().find(|l| l.contains("agent10")).unwrap_or_default();
-    assert!(!tenth.contains(" 10 "), "row 10 must not advertise an unreachable key: {tenth:?}");
-}
-
-#[test]
-fn a_picker_taller_than_the_pane_scrolls_to_keep_the_highlight_visible() {
-    let mut app = edited_app();
-    write_comment(&mut app, "one");
-    let rows: Vec<AgentChoice> = (1..=20)
-        .map(|i| agent_row(&format!("w8:p{i}"), &format!("agent{i}"), "idle", "1"))
-        .collect();
-    app.open_picker(rows);
-
-    // A short frame cannot show twenty rows; the last one is still reachable.
-    let short = dump(&render_size(&app, 80, 12));
-    assert!(!short.contains("agent20"), "the tail is clipped at this height:\n{short}");
-
-    app.picker_goto(19);
-    let scrolled = dump(&render_size(&app, 80, 12));
-    assert!(scrolled.contains("agent20"), "the view follows the highlight:\n{scrolled}");
-
-    // The popup clamps to the body band, so even this over-tall picker never covers the
-    // footer — the one surface advertising its keys.
-    let last_row = scrolled.lines().last().unwrap_or_default().to_string();
-    assert!(last_row.contains("enter"), "the footer keeps the picker's keys: {last_row:?}");
-}
-
-#[test]
-fn a_click_on_a_picker_row_moves_the_highlight_and_misses_stay_inert() {
-    let mut app = picker_app();
-    let area = Rect::new(0, 0, 140, 40);
-    let out = render(&app);
-
-    let (row_y, line) = out
-        .lines()
-        .enumerate()
-        .find(|(_, l)| l.contains("codex"))
-        .map(|(y, l)| (y as u16, l.to_string()))
-        .expect("the codex row is painted");
-    let col = line.find("codex").expect("a column inside the row") as u16;
-
-    assert_eq!(ui::hit_picker_row(area, &app, col, row_y), Some(2));
-    // The title row and everything outside the popup are inert.
-    assert_eq!(ui::hit_picker_row(area, &app, col, row_y - 3), None);
-    assert_eq!(ui::hit_picker_row(area, &app, 0, 0), None);
-
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
-            column: col,
-            row: row_y,
-            modifiers: KeyModifiers::NONE,
-        },
-        area,
-        &[],
-        &Keymap::default(),
-        &herdr_reviewr::export::Clipboard,
-    )
-    .unwrap();
-    assert_eq!(app.picker_cursor, 2, "a click moves the highlight to the clicked row");
-}
-
 // --- Header base label ------------------------------------------------------
 
 /// A repo on branch `feature` past `main`, with `origin/HEAD` naming `main` the default.
@@ -3134,7 +2894,7 @@ fn the_branch_header_names_the_base_and_its_click_opens_the_picker() {
         modifiers: KeyModifiers::NONE,
     };
     let keymap = app.keymap().clone();
-    handle_mouse(&mut app, click, AREA, &[], &keymap, &herdr_reviewr::export::Clipboard).unwrap();
+    handle_mouse(&mut app, click, AREA, &[], &keymap, &diple::export::Clipboard).unwrap();
     let frame = render(&app);
     assert!(frame.contains("base · 2 branches"), "the click opens the picker popup");
     assert!(frame.contains("dev"), "the sibling branch is a row");
@@ -3151,11 +2911,11 @@ fn a_named_rev_paints_the_spelling_and_abbrev() {
     r.write("hello.rs", "alpha\nBETA\n");
     r.commit_all("edit");
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    herdr_reviewr::git::write_base_pick(r.path(), "HEAD~1").unwrap();
+    diple::git::write_base_pick(r.path(), "HEAD~1").unwrap();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
     let line0 = render(&app).lines().next().unwrap().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     assert!(
         line0.contains(&format!("vs HEAD~1 ({short})")),
         "a named rev paints the spelling and the abbreviated SHA: {line0}"
@@ -3172,10 +2932,10 @@ fn a_sha_pick_paints_once() {
     r.write("hello.rs", "alpha\nBETA\n");
     r.commit_all("edit");
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    herdr_reviewr::git::write_base_pick(r.path(), &parent).unwrap();
+    diple::git::write_base_pick(r.path(), &parent).unwrap();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     let line0 = render(&app).lines().next().unwrap().to_string();
     assert!(line0.contains(&format!("vs {short}")), "a SHA spelling paints once: {line0}");
     assert!(
@@ -3183,7 +2943,7 @@ fn a_sha_pick_paints_once() {
         "a SHA spelling does not repeat as a marker: {line0}"
     );
 
-    herdr_reviewr::git::write_base_pick(r.path(), &short).unwrap();
+    diple::git::write_base_pick(r.path(), &short).unwrap();
     app.reload().unwrap();
     let line0 = render(&app).lines().next().unwrap().to_string();
     assert!(
@@ -3209,7 +2969,7 @@ fn a_flag_named_rev_paints_the_same_form() {
     let mut app = App::new(r.path_buf(), Scope::Branch, Some("HEAD~1".to_string()));
     app.reload().unwrap();
     let line0 = render(&app).lines().next().unwrap().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     assert!(
         line0.contains(&format!("vs HEAD~1 ({short})")),
         "the --base flag uses the same paint: {line0}"
@@ -3220,7 +2980,7 @@ fn a_flag_named_rev_paints_the_same_form() {
 fn a_probe_row_is_the_typed_spelling() {
     let (r, mut app) = based_app();
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     app.open_base_picker();
     for ch in "HEAD~1".chars() {
         app.input_push(ch);
@@ -3246,7 +3006,7 @@ fn a_probe_row_right_aligns_the_sha_like_the_open_list() {
     r.write("hello.rs", "alpha\nBETA\n");
     r.commit_all("edit");
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
     app.open_base_picker();
@@ -3280,7 +3040,7 @@ fn a_probe_row_right_aligns_the_sha_like_the_open_list() {
 fn a_short_sha_prefix_probe_completes_to_the_abbrev() {
     let (r, mut app) = based_app();
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     let prefix = short[..4].to_string();
     app.open_base_picker();
     for ch in prefix.chars() {
@@ -3300,7 +3060,7 @@ fn a_short_sha_prefix_probe_completes_to_the_abbrev() {
 fn a_seven_char_sha_probe_is_not_marked() {
     let (r, mut app) = based_app();
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     app.open_base_picker();
     for ch in short.chars() {
         app.input_push(ch);
@@ -3320,7 +3080,7 @@ fn a_skipped_named_rev_uses_the_stored_spelling() {
     r.write("hello.rs", "alpha\n");
     r.commit_all("init");
     r.set_origin_default("main", "main");
-    herdr_reviewr::git::write_base_pick(r.path(), "HEAD~1").unwrap();
+    diple::git::write_base_pick(r.path(), "HEAD~1").unwrap();
     r.git(&["checkout", "-q", "-b", "feature"]);
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
@@ -3337,7 +3097,7 @@ fn a_skipped_pick_warns_beside_the_resolved_base() {
     r.write("hello.rs", "alpha\n");
     r.commit_all("init");
     r.set_origin_default("main", "main");
-    herdr_reviewr::git::write_base_pick(r.path(), "gone").unwrap();
+    diple::git::write_base_pick(r.path(), "gone").unwrap();
     r.git(&["checkout", "-q", "-b", "feature"]);
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
@@ -3364,7 +3124,7 @@ fn a_dormant_pick_shows_beside_the_empty_state() {
     let r = Repo::init();
     r.write("hello.rs", "alpha\n");
     r.commit_all("init");
-    herdr_reviewr::git::write_base_pick(r.path(), "gone").unwrap();
+    diple::git::write_base_pick(r.path(), "gone").unwrap();
     r.git(&["checkout", "-q", "-b", "feature"]);
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
@@ -3387,11 +3147,11 @@ fn a_named_rev_clips_the_spelling_and_keeps_the_sha() {
     let parent = r.git(&["rev-parse", "HEAD~1"]).trim().to_string();
     let long = format!("release-{}", "x".repeat(80));
     r.git(&["tag", &long, &parent]);
-    herdr_reviewr::git::write_base_pick(r.path(), &long).unwrap();
+    diple::git::write_base_pick(r.path(), &long).unwrap();
     let mut app = app_on(&r);
     app.set_scope(Scope::Branch).unwrap();
     let line0 = dump(&render_size(&app, 80, 20)).lines().next().unwrap().to_string();
-    let short = herdr_reviewr::git::abbreviate_oid(&parent);
+    let short = diple::git::abbreviate_oid(&parent);
     assert!(line0.contains(&format!("({short})")), "the SHA marker survives the clip: {line0}");
     assert!(line0.contains('…'), "the spelling truncates: {line0}");
     assert!(line0.contains("1 changed"), "the right-aligned stats survive: {line0}");
@@ -3404,7 +3164,7 @@ fn an_overlong_base_name_truncates_with_an_ellipsis() {
     r.commit_all("init");
     let long = format!("feature/{}", "x".repeat(80));
     r.git(&["branch", &long]);
-    herdr_reviewr::git::write_base_pick(r.path(), &long).unwrap();
+    diple::git::write_base_pick(r.path(), &long).unwrap();
     r.git(&["checkout", "-q", "-b", "work"]);
     r.write("hello.rs", "alpha\nBETA\n");
     r.commit_all("edit");
@@ -3423,7 +3183,7 @@ fn a_narrow_header_never_maps_a_click_outside_the_painted_base() {
     r.commit_all("init");
     let long = format!("feature/{}", "x".repeat(60));
     r.git(&["branch", &long]);
-    herdr_reviewr::git::write_base_pick(r.path(), &long).unwrap();
+    diple::git::write_base_pick(r.path(), &long).unwrap();
     r.git(&["checkout", "-q", "-b", "work"]);
     r.write("hello.rs", "alpha\nBETA\n");
     r.commit_all("edit");
@@ -3473,7 +3233,7 @@ fn an_overlong_skipped_tail_never_evicts_the_base_name() {
     r.commit_all("init");
     r.set_origin_default("main", "main");
     let long = format!("feature/{}", "x".repeat(80));
-    herdr_reviewr::git::write_base_pick(r.path(), &long).unwrap();
+    diple::git::write_base_pick(r.path(), &long).unwrap();
     r.git(&["checkout", "-q", "-b", "work"]);
     r.write("hello.rs", "alpha\nBETA\n");
     r.commit_all("edit");
@@ -3551,7 +3311,7 @@ fn the_plus_button_right_aligns_in_a_wide_number_field() {
 
 #[test]
 fn the_text_selection_highlights_the_dragged_span() {
-    use herdr_reviewr::selection::{Point, Surface, TextDrag};
+    use diple::selection::{Point, Surface, TextDrag};
     let (_repo, mut app) = selection_app();
     let area = Rect::new(0, 0, 140, 40);
     let inner = ui::read_inner_rect(area, &app);
@@ -3562,7 +3322,7 @@ fn the_text_selection_highlights_the_dragged_span() {
     app.diff_cursor = 1;
 
     // `beta` on row 0 through char 1 (`本`) of row 2: a three-row stream selection.
-    app.gesture = herdr_reviewr::selection::Gesture::Text {
+    app.gesture = diple::selection::Gesture::Text {
         drag: TextDrag {
             surface: Surface::Read,
             anchor: Point { row: 0, chr: 6 },
@@ -3703,7 +3463,7 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     );
     app.keys_expanded = true;
     let expanded = render(&app);
-    assert!(expanded.contains("u/b/t/g scope"), "the go band names four scopes:\n{expanded}");
+    assert!(expanded.contains("u/b/g scope"), "the go band names all scopes:\n{expanded}");
     assert!(expanded.contains("G commits"), "and the picker key:\n{expanded}");
     app.keys_expanded = false;
 
@@ -3756,7 +3516,7 @@ fn the_commits_header_names_the_pick_and_its_verdict() {
     );
     let footer = footer_line(&out);
     assert!(footer.trim_start().starts_with("G commits"), "{footer}");
-    assert!(footer.contains("u/b/t scope"), "the other three scopes: {footer}");
+    assert!(footer.contains("u/b scope"), "the other scopes: {footer}");
 }
 
 #[test]
@@ -3902,7 +3662,7 @@ fn a_row_shows_one_ref_by_what_matters_most() {
     app.close_commit_picker();
 
     // The open PR's head outranks every ref.
-    app.pr = herdr_reviewr::forge::PrView::Pr(Box::new(herdr_reviewr::forge::PrSnapshot {
+    app.pr = diple::forge::PrView::Pr(Box::new(diple::forge::PrSnapshot {
         head_oid: shas[3].clone(),
         ..common::pr_snapshot()
     }));

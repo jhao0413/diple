@@ -1,6 +1,6 @@
 //! Optional event log for live debugging.
 //!
-//! When `$HERDR_REVIEW_LOG` names a writable file, the binary appends one
+//! When `$DIPLE_LOG` names a writable file, the binary appends one
 //! timestamped line per input event, refresh, comment change, and export — enough
 //! to reconstruct a session. Unset is the default and makes every call site a
 //! no-op (the `logln!` macro skips formatting), so this is never product behavior.
@@ -12,10 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 
-/// Open the log sink from `$HERDR_REVIEW_LOG` if set. Call once at startup.
+/// Open the log sink from `$DIPLE_LOG` if set. Call once at startup.
 pub fn init() {
     SINK.get_or_init(|| {
-        let path = std::env::var("HERDR_REVIEW_LOG").ok()?;
+        let path = std::env::var("DIPLE_LOG").ok()?;
         OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
     });
 }

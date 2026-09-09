@@ -1,14 +1,14 @@
 [package]
-name = "herdr-reviewr"
-version = "0.36.2"
+name = "diple"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "A terminal review pane for herdr: browse an agent's changes and send comments back to chat."
-authors = ["Dmitry Persiyanov <dmitry.persiyanov@gmail.com>"]
+description = "A focused terminal code-review tool for local changes, branches, and commits."
+authors = ["Jhao", "Dmitry Persiyanov <dmitry.persiyanov@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/persiyanov/herdr-reviewr"
+repository = "https://github.com/jhao0413/diple"
 readme = "README.md"
-keywords = ["herdr", "tui", "diff", "review", "agent"]
+keywords = ["tui", "diff", "review", "git", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]

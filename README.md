@@ -15,6 +15,7 @@ particular AI workflow.
 - Stages or unstages the selected file with `a` without modifying the worktree.
 - Reviews a branch against an automatically resolved or manually selected base.
 - Reviews one commit or a contiguous run of commits.
+- Adapts wide Changes panes into old/new source columns and keeps narrow panes unified.
 - Adds comments to exact old-side or new-side line ranges.
 - Browses and searches the whole repository, with syntax highlighting and Markdown preview.
 - Shows a read-only pull-request or merge-request view when `gh`, `glab`, or `az` is available.
@@ -34,18 +35,15 @@ With WinGet on Windows (available after the initial community manifest is indexe
 winget install --id Jhao0413.Diple -e
 ```
 
-With Cargo directly from the source repository:
+With Cargo:
 
 ```sh
-cargo install --git https://github.com/jhao0413/diple
+cargo install diple
 ```
 
 Prebuilt binaries and SHA-256 checksums are also available from the
 [latest GitHub release](https://github.com/jhao0413/diple/releases/latest) for Apple Silicon,
 Intel macOS, x86-64 Linux, ARM64 Linux, and x86-64 Windows.
-
-`cargo install diple` will be added after the crate is published to crates.io; the Git and
-Homebrew methods above are available independently of that registry publication.
 
 ## Use
 
@@ -138,7 +136,7 @@ Diple reads `config.toml` from the platform configuration directory under `diple
 ```toml
 theme = "catppuccin-mocha"
 default_scope = "uncommitted"
-navigator_position = "right"
+navigator_position = "left"
 editor = "code -g {file}:{line}"
 
 [keybindings]

@@ -21,7 +21,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
 use crate::config::NavigatorPosition;
-use crate::diff::{FileDiff, FileState, Row};
+use crate::diff::{FileDiff, FileState, Row, View};
 use crate::file_list::{Annotation, RowKind};
 use crate::forge;
 use crate::git;
@@ -303,6 +303,7 @@ pub fn diff_viewport_height(area: Rect, app: &App) -> usize {
 pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
     let width = inner_rect(panes(area, app).diff).width as usize;
     let gutter_w = gutter_for(&app.diff);
+    let columns = split_diff_columns(app, width);
     let p = app.palette();
     // A row's display height is its wrapped code lines plus any inline comment cards under
     // it (excluding a card whose comment is being edited), so scroll-clamping and hit-testing
@@ -313,7 +314,7 @@ pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let base = row_height(r, gutter_w, width, app.wrap);
+            let base = row_height(r, gutter_w, width, app.wrap, columns);
             let card: usize = cards
                 .iter()
                 .filter(|&&(row, ci)| row == i && Some(ci) != editing)
@@ -368,6 +369,7 @@ fn read_layout(app: &App, inner: Rect) -> Vec<Slot> {
     let height = inner.height as usize;
     let width = inner.width as usize;
     let gutter_w = gutter_for(&app.diff);
+    let columns = split_diff_columns(app, width);
     let p = app.palette();
     let cards = app.card_rows();
     let editing = editing_comment(app);
@@ -375,7 +377,7 @@ fn read_layout(app: &App, inner: Rect) -> Vec<Slot> {
     // A row's slots: its wrapped code lines, then its visible cards' lines — the same order
     // `render_diff_view`'s `row_lines` paints them.
     let row_slots = |i: usize| -> Vec<Slot> {
-        let segs = row_height(&app.visible[i], gutter_w, width, app.wrap);
+        let segs = row_height(&app.visible[i], gutter_w, width, app.wrap, columns);
         let mut out: Vec<Slot> = (0..segs).map(|seg| Slot::Code { row: i, seg }).collect();
         for &(_, ci) in cards.iter().filter(|&&(row, _)| row == i) {
             if Some(ci) != editing
@@ -436,7 +438,8 @@ fn seg_cell_range(app: &App, cells: &[Cell], seg: usize, code_width: usize) -> (
         let segs = wrap_segments(cells, code_width.max(1), ContinuationSpaces::Trim);
         segs.get(seg).copied().unwrap_or((0, 0))
     } else {
-        (skip_columns(cells, app.h_scroll), cells.len())
+        let start = skip_columns(cells, app.h_scroll);
+        (start, start + cells_fitting(&cells[start..], code_width))
     }
 }
 
@@ -480,11 +483,79 @@ pub fn widest_visible_row(app: &App, area: Rect) -> usize {
 struct ReadPane {
     inner: Rect,
     prefix_w: usize,
+    columns: Option<SplitDiffColumns>,
 }
 
 fn read_pane(area: Rect, app: &App) -> ReadPane {
     let inner = inner_rect(panes(area, app).diff);
-    ReadPane { inner, prefix_w: gutter_prefix_width(gutter_for(&app.diff)) }
+    ReadPane {
+        inner,
+        prefix_w: gutter_prefix_width(gutter_for(&app.diff)),
+        columns: split_diff_columns(app, inner.width as usize),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceLane {
+    offset: usize,
+    width: usize,
+}
+
+/// The painted source lanes for a row, measured from the read pane's inner left edge.
+fn source_lanes(row: &Row, pane: &ReadPane) -> Vec<SourceLane> {
+    let Some(columns) = pane.columns else {
+        return vec![SourceLane { offset: 0, width: pane.inner.width as usize }];
+    };
+    let right = SourceLane { offset: columns.left + 1, width: columns.right };
+    match row {
+        Row::Deletion { .. } => vec![SourceLane { offset: 0, width: columns.left }],
+        Row::Insertion { .. } => vec![right],
+        Row::Context { .. } => {
+            vec![SourceLane { offset: 0, width: columns.left }, right]
+        }
+        Row::Fold { .. } => Vec::new(),
+    }
+}
+
+fn source_lane_at(row: &Row, pane: &ReadPane, col: usize) -> Option<SourceLane> {
+    source_lanes(row, pane)
+        .into_iter()
+        .find(|lane| col >= lane.offset && col < lane.offset + lane.width)
+}
+
+fn lane_has_segment(app: &App, row: &Row, lane: SourceLane, prefix_w: usize, seg: usize) -> bool {
+    if !app.wrap {
+        return seg == 0;
+    }
+    let cells = code_cells(row, false, &[]);
+    let code_width = lane.width.saturating_sub(prefix_w).max(1);
+    seg < wrap_segments(&cells, code_width, ContinuationSpaces::Trim).len()
+}
+
+fn nearest_source_lane(
+    app: &App,
+    row: &Row,
+    pane: &ReadPane,
+    seg: usize,
+    col: usize,
+) -> Option<SourceLane> {
+    source_lanes(row, pane)
+        .into_iter()
+        .filter(|&lane| lane_has_segment(app, row, lane, pane.prefix_w, seg))
+        .min_by_key(|lane| {
+            if col < lane.offset {
+                lane.offset - col
+            } else {
+                col.saturating_sub(lane.offset + lane.width.saturating_sub(1))
+            }
+        })
+}
+
+/// The gutter that owns comments for a row. Context anchors to the new side, matching
+/// `app::anchor`; deletions anchor to the old side.
+fn comment_lane(row: &Row, pane: &ReadPane) -> Option<SourceLane> {
+    let lanes = source_lanes(row, pane);
+    if matches!(row, Row::Deletion { .. }) { lanes.first().copied() } else { lanes.last().copied() }
 }
 
 /// The read pane's content rows — the inner rect minus the find band's reserved row
@@ -507,11 +578,6 @@ pub fn read_point_at(area: Rect, app: &App, col: u16, row: u16) -> Option<crate:
     if !contains(pane.inner, col, row) {
         return None;
     }
-    // The gutter is chrome, not text: a mouse-down there never starts a text drag
-    // (owns the gutter's gestures).
-    if (col as usize) < pane.inner.x as usize + pane.prefix_w {
-        return None;
-    }
     let slots = app.painted_slots();
     let Slot::Code { row: li, seg } = *slots.get((row - pane.inner.y) as usize)? else {
         return None;
@@ -520,8 +586,17 @@ pub fn read_point_at(area: Rect, app: &App, col: u16, row: u16) -> Option<crate:
     if !r.is_content() {
         return None;
     }
-    let code_width = (pane.inner.width as usize).saturating_sub(pane.prefix_w).max(1);
-    let col_in_code = (col as usize).saturating_sub(pane.inner.x as usize + pane.prefix_w);
+    let rel = (col - pane.inner.x) as usize;
+    let lane = source_lane_at(r, &pane, rel)?;
+    if !lane_has_segment(app, r, lane, pane.prefix_w, seg) {
+        return None;
+    }
+    // Each source lane owns a gutter; chrome never starts a text drag.
+    if rel < lane.offset + pane.prefix_w {
+        return None;
+    }
+    let code_width = lane.width.saturating_sub(pane.prefix_w).max(1);
+    let col_in_code = rel.saturating_sub(lane.offset + pane.prefix_w);
     Some(crate::selection::Point {
         row: li,
         chr: seg_char_at(app, r, seg, code_width, col_in_code),
@@ -556,8 +631,11 @@ pub fn read_point_clamped(
         // A fold paints as one Code slot; snap its endpoint to the row's start.
         return Some(crate::selection::Point { row: li, chr: 0 });
     }
-    let code_width = (pane.inner.width as usize).saturating_sub(pane.prefix_w).max(1);
-    let col_in_code = (col as usize).saturating_sub(pane.inner.x as usize + pane.prefix_w);
+    let rel = (col - pane.inner.x) as usize;
+    let lane = nearest_source_lane(app, r, &pane, seg, rel)?;
+    let lane_col = rel.clamp(lane.offset, lane.offset + lane.width.saturating_sub(1));
+    let code_width = lane.width.saturating_sub(pane.prefix_w).max(1);
+    let col_in_code = lane_col.saturating_sub(lane.offset + pane.prefix_w);
     Some(crate::selection::Point {
         row: li,
         chr: seg_char_at(app, r, seg, code_width, col_in_code),
@@ -573,12 +651,19 @@ pub fn gutter_row_at(area: Rect, app: &App, col: u16, row: u16) -> Option<usize>
         return None;
     }
     let pane = read_pane(area, app);
-    if !contains(pane.inner, col, row) || (col as usize) >= pane.inner.x as usize + pane.prefix_w {
+    if !contains(pane.inner, col, row) {
         return None;
     }
     let slots = app.painted_slots();
     match *slots.get((row - pane.inner.y) as usize)? {
-        Slot::Code { row: li, .. } if app.visible[li].is_content() => Some(li),
+        Slot::Code { row: li, seg } if app.visible[li].is_content() => {
+            let rel = (col - pane.inner.x) as usize;
+            let lane = comment_lane(&app.visible[li], &pane)?;
+            (lane_has_segment(app, &app.visible[li], lane, pane.prefix_w, seg)
+                && rel >= lane.offset
+                && rel < lane.offset + pane.prefix_w)
+                .then_some(li)
+        }
         _ => None,
     }
 }
@@ -621,7 +706,6 @@ fn render_text_selection(frame: &mut Frame, app: &App, area: Rect) {
         Surface::Read => {
             let pane = read_pane(area, app);
             let slots = app.painted_slots();
-            let code_width = (pane.inner.width as usize).saturating_sub(pane.prefix_w).max(1);
             for (off, slot) in slots.iter().enumerate() {
                 let Slot::Code { row: li, seg } = *slot else { continue };
                 if li < lo.row || li > hi.row {
@@ -632,28 +716,33 @@ fn render_text_selection(frame: &mut Frame, app: &App, area: Rect) {
                     continue;
                 }
                 let cells = code_cells(row_ref, false, &[]);
-                let (seg_s, seg_e) = seg_cell_range(app, &cells, seg, code_width);
                 let y = pane.inner.y + off as u16;
-                let max_x = (pane.inner.x + pane.inner.width) as usize;
-                let mut x = pane.inner.x as usize + pane.prefix_w;
-                for painted in &cells[seg_s..seg_e] {
-                    let sel = (li > lo.row || painted.src >= lo.chr)
-                        && (li < hi.row || painted.src <= hi.chr);
-                    if sel {
-                        for dx in 0..painted.w {
-                            // A wide char straddling the pane's right edge must not tint
-                            // the border cell, like `paint_text_span`.
-                            if x + dx >= max_x {
-                                break;
-                            }
-                            if let Some(cell) = frame.buffer_mut().cell_mut(((x + dx) as u16, y)) {
-                                cell.set_style(style);
+                for lane in source_lanes(row_ref, &pane) {
+                    let code_width = lane.width.saturating_sub(pane.prefix_w).max(1);
+                    let (seg_s, seg_e) = seg_cell_range(app, &cells, seg, code_width);
+                    let max_x = pane.inner.x as usize + lane.offset + lane.width;
+                    let mut x = pane.inner.x as usize + lane.offset + pane.prefix_w;
+                    for painted in &cells[seg_s..seg_e] {
+                        let sel = (li > lo.row || painted.src >= lo.chr)
+                            && (li < hi.row || painted.src <= hi.chr);
+                        if sel {
+                            for dx in 0..painted.w {
+                                // A wide char straddling a lane's right edge must not tint
+                                // the divider or pane border, like `paint_text_span`.
+                                if x + dx >= max_x {
+                                    break;
+                                }
+                                if let Some(cell) =
+                                    frame.buffer_mut().cell_mut(((x + dx) as u16, y))
+                                {
+                                    cell.set_style(style);
+                                }
                             }
                         }
-                    }
-                    x += painted.w;
-                    if x >= max_x {
-                        break;
+                        x += painted.w;
+                        if x >= max_x {
+                            break;
+                        }
                     }
                 }
             }
@@ -1878,6 +1967,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     let layout = RowLayout {
         gutter_w,
         width,
+        columns: split_diff_columns(app, width),
         h_scroll: app.h_scroll,
         wrap: app.wrap,
         focused: app.focus == Focus::Diff,
@@ -2000,16 +2090,67 @@ fn gutter_prefix_width(gutter_w: usize) -> usize {
     1 + gutter_w + 1
 }
 
+/// The read-pane width at which a Changes diff has enough room for two useful source lanes.
+/// This is the pane's interior width, not the whole terminal, so resizing the navigator can
+/// cross the same responsive boundary as resizing the terminal.
+const SIDE_BY_SIDE_MIN_WIDTH: usize = 120;
+
+/// Source-lane widths inside a side-by-side diff. The one remaining cell is the divider.
+#[derive(Clone, Copy)]
+struct SplitDiffColumns {
+    left: usize,
+    right: usize,
+}
+
+fn split_diff_columns(app: &App, width: usize) -> Option<SplitDiffColumns> {
+    (app.tab == Tab::Changes && app.diff.view == View::Diff && width >= SIDE_BY_SIDE_MIN_WIDTH)
+        .then(|| {
+            let left = width.saturating_sub(1) / 2;
+            SplitDiffColumns { left, right: width.saturating_sub(1 + left) }
+        })
+}
+
+/// The source-lane widths that carry this logical row. Context is mirrored into both lanes,
+/// while a changed row appears only on the side it belongs to.
+fn row_lane_widths(
+    row: &Row,
+    width: usize,
+    columns: Option<SplitDiffColumns>,
+) -> [Option<usize>; 2] {
+    let Some(columns) = columns else { return [Some(width), None] };
+    match row {
+        Row::Deletion { .. } => [Some(columns.left), None],
+        Row::Insertion { .. } => [None, Some(columns.right)],
+        Row::Context { .. } => [Some(columns.left), Some(columns.right)],
+        Row::Fold { .. } => [Some(width), None],
+    }
+}
+
 /// How many display rows a row needs: 1 for a fold or with wrap off, else the number of
 /// word-wrapped segments its (tab-expanded) content fills. Shares [`wrap_segments`] with
 /// the renderer so per-row geometry stays aligned with what gets painted.
-fn row_height(row: &Row, gutter_w: usize, width: usize, wrap: bool) -> usize {
+fn row_height(
+    row: &Row,
+    gutter_w: usize,
+    width: usize,
+    wrap: bool,
+    columns: Option<SplitDiffColumns>,
+) -> usize {
     if !wrap || matches!(row, Row::Fold { .. }) {
         return 1;
     }
-    let code_width = width.saturating_sub(gutter_prefix_width(gutter_w)).max(1);
-    // The find highlight never changes wrapping, so height ignores it.
-    wrap_segments(&code_cells(row, false, &[]), code_width, ContinuationSpaces::Trim).len()
+    let cells = code_cells(row, false, &[]);
+    // The find highlight never changes wrapping, so height ignores it. Context may wrap one
+    // line earlier in the narrower of two uneven lanes, hence the maximum.
+    row_lane_widths(row, width, columns)
+        .into_iter()
+        .flatten()
+        .map(|lane| {
+            let code_width = lane.saturating_sub(gutter_prefix_width(gutter_w)).max(1);
+            wrap_segments(&cells, code_width, ContinuationSpaces::Trim).len()
+        })
+        .max()
+        .unwrap_or(1)
 }
 
 /// The diff-pane layout: constant for a frame.
@@ -2017,6 +2158,8 @@ fn row_height(row: &Row, gutter_w: usize, width: usize, wrap: bool) -> usize {
 struct RowLayout<'a> {
     gutter_w: usize,
     width: usize,
+    /// Present only for a wide Changes diff; absent for unified rows and PR snippets.
+    columns: Option<SplitDiffColumns>,
     h_scroll: usize,
     wrap: bool,
     /// Whether the diff pane is focused — dims the cursor row when it is not.
@@ -2047,8 +2190,8 @@ struct RowState {
 /// into `code_width`-wide rows; a continuation row carries a blank gutter so numbers
 /// stay aligned. With wrap off, the line is one row scrolled by `h_scroll`.
 fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'static>> {
-    let RowLayout { gutter_w, width, h_scroll, wrap, focused, pal, find, expand_hint } = layout;
-    let RowState { commented, cursor, selected, hovered } = state;
+    let RowLayout { width, focused, pal, expand_hint, .. } = layout;
+    let RowState { cursor, .. } = state;
     if let Row::Fold { .. } = row {
         let label = if cursor {
             format!("  ⋯  {} unmodified lines — {expand_hint} expand", row.hidden())
@@ -2062,12 +2205,62 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         let bg = if cursor { pal.cursor_bg(focused) } else { pal.surface0 };
         return vec![line.style(Style::default().bg(bg).add_modifier(Modifier::BOLD))];
     }
+
+    let Some(columns) = layout.columns else {
+        let number = row.new_no().or_else(|| row.old_no());
+        return render_source_lane(row, layout.width, number, layout, state);
+    };
+
+    // The logical-row model remains unchanged: a deletion occupies the old lane, an insertion
+    // the new lane, and context is mirrored. Keeping one logical row per display band preserves
+    // cursor, comment, fold, and scroll identities while still presenting old/new source sides.
+    let (left, right) = match row {
+        Row::Deletion { old_no, .. } => {
+            (render_source_lane(row, columns.left, Some(*old_no), layout, state), Vec::new())
+        }
+        Row::Insertion { new_no, .. } => {
+            (Vec::new(), render_source_lane(row, columns.right, Some(*new_no), layout, state))
+        }
+        Row::Context { old_no, new_no, .. } => {
+            // A context comment anchors to the new side, so only that gutter advertises `[+]`.
+            let old_state = RowState { commented: false, hovered: false, ..state };
+            (
+                render_source_lane(row, columns.left, Some(*old_no), layout, old_state),
+                render_source_lane(row, columns.right, Some(*new_no), layout, state),
+            )
+        }
+        Row::Fold { .. } => unreachable!("folds return above"),
+    };
+    let height = left.len().max(right.len()).max(1);
+    (0..height)
+        .map(|i| {
+            let mut spans = left.get(i).map_or_else(
+                || vec![Span::raw(" ".repeat(columns.left))],
+                |line| line.spans.clone(),
+            );
+            spans.push(Span::styled("│", Style::default().fg(pal.surface2)));
+            spans.extend(right.get(i).map_or_else(
+                || vec![Span::raw(" ".repeat(columns.right))],
+                |line| line.spans.clone(),
+            ));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Render one old/new source lane. Every returned line is padded to exactly `width`, so it can
+/// be safely composed beside another lane without long unwrapped code crossing the divider.
+fn render_source_lane(
+    row: &Row,
+    width: usize,
+    number: Option<u32>,
+    layout: RowLayout<'_>,
+    state: RowState,
+) -> Vec<Line<'static>> {
+    let RowLayout { gutter_w, h_scroll, wrap, focused, pal, find, .. } = layout;
+    let RowState { commented, cursor, selected, hovered } = state;
     // `0` is an unnumbered PR snippet row; file diffs are 1-based.
-    let num = row
-        .new_no()
-        .or_else(|| row.old_no())
-        .filter(|&n| n > 0)
-        .map_or(String::new(), |n| n.to_string());
+    let num = number.filter(|&n| n > 0).map_or(String::new(), |n| n.to_string());
     // A commented line's number takes the orange comment accent; others sit a step brighter
     // than the dim chrome so they stay legible while read.
     let num_color = if commented { pal.orange } else { pal.dim1 };
@@ -2112,7 +2305,9 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
             .map(|(s, e)| &cells[s..e])
             .collect()
     } else {
-        vec![cells.get(skip_columns(&cells, h_scroll)..).unwrap_or(&[])]
+        let start = skip_columns(&cells, h_scroll);
+        let end = start + cells_fitting(&cells[start..], code_width);
+        vec![cells.get(start..end).unwrap_or(&[])]
     };
 
     chunks
@@ -2160,7 +2355,16 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
                 line.push_span(Span::raw(" ".repeat(pad)));
             }
             match row_bg {
-                Some(bg) => line.style(Style::default().bg(bg)),
+                Some(bg) => {
+                    for span in &mut line.spans {
+                        // Cell-level find and word-emphasis backgrounds outrank the lane fill,
+                        // as they did when the fill lived on the enclosing `Line` style.
+                        if span.style.bg.is_none() {
+                            span.style = span.style.bg(bg);
+                        }
+                    }
+                    line
+                }
                 None => line,
             }
         })
@@ -2250,6 +2454,22 @@ fn skip_columns(cells: &[Cell], cols: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// The number of leading cells that fit wholly inside `width` display columns. Unlike word
+/// wrapping this is a hard clip, used by unwrapped split lanes so text cannot cross the divider.
+fn cells_fitting(cells: &[Cell], width: usize) -> usize {
+    let mut columns = 0;
+    cells
+        .iter()
+        .take_while(|cell| {
+            let fits = columns + cell.w <= width;
+            if fits {
+                columns += cell.w;
+            }
+            fits
+        })
+        .count()
 }
 
 /// One display cell of a code line: a glyph, its terminal width in columns (1 for most
@@ -4330,6 +4550,7 @@ fn push_finding_quote(
         let layout = RowLayout {
             gutter_w,
             width,
+            columns: None,
             h_scroll: 0,
             wrap: true,
             focused: false,

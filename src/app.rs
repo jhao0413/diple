@@ -888,7 +888,7 @@ impl App {
             painted_slots: std::cell::RefCell::new(Vec::new()),
             painted_anchors: std::cell::RefCell::new(Vec::new()),
             pr_read_max_scroll: std::cell::Cell::new(usize::MAX),
-            navigator_position: crate::config::NavigatorPosition::Right,
+            navigator_position: crate::config::NavigatorPosition::Left,
             navigator_side_pct: DEFAULT_SIDE_PCT,
             navigator_stack_pct: DEFAULT_STACK_PCT,
             navigator_hidden: false,

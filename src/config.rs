@@ -80,9 +80,9 @@ const APP_CONFIG_KEYS: [&str; 8] = [
 /// Where the navigator sits around the read pane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NavigatorPosition {
-    #[default]
     Right,
     Bottom,
+    #[default]
     Left,
     Top,
 }
@@ -133,7 +133,7 @@ impl Default for AppConfig {
         Self {
             theme: crate::theme::DEFAULT.to_owned(),
             default_scope: crate::model::Scope::Uncommitted,
-            navigator_position: NavigatorPosition::Right,
+            navigator_position: NavigatorPosition::Left,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -576,7 +576,7 @@ mod tests {
         let config = super::app_config_in(dir.path()).unwrap();
         assert_eq!(config.theme(), "gruvbox");
         assert_eq!(config.default_scope(), Scope::Uncommitted);
-        assert_eq!(config.navigator_position(), NavigatorPosition::Right);
+        assert_eq!(config.navigator_position(), NavigatorPosition::Left);
         assert_eq!(config.github_host(), None);
     }
 
@@ -932,7 +932,7 @@ mod tests {
         let object = value.as_object().unwrap();
         assert_eq!(object.len(), super::APP_CONFIG_KEYS.len(), "one JSON key per config key");
         assert_eq!(object["default_scope"], "uncommitted");
-        assert_eq!(object["navigator_position"], "right");
+        assert_eq!(object["navigator_position"], "left");
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(

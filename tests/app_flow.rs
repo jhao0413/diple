@@ -1797,7 +1797,7 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
     let cursor = app.diff_cursor;
 
     press(&mut app, &keymap, KeyCode::Char('p'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Bottom);
+    assert_eq!(app.navigator_position, NavigatorPosition::Top);
     assert_eq!(app.focus, Focus::Diff);
     assert_eq!(app.diff_cursor, cursor);
     assert_eq!(app.diff_scroll, 1);
@@ -1805,21 +1805,21 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
     press(&mut app, &keymap, KeyCode::Char('<'));
     assert_eq!(app.navigator_stack_pct, 29);
     press(&mut app, &keymap, KeyCode::Char('p'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Left);
+    assert_eq!(app.navigator_position, NavigatorPosition::Right);
     assert_eq!(app.navigator_side_pct, 32, "switching axis restores the side share");
     press(&mut app, &keymap, KeyCode::Char('<'));
     assert_eq!(app.navigator_side_pct, 36);
     press(&mut app, &keymap, KeyCode::Char('p'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Top);
+    assert_eq!(app.navigator_position, NavigatorPosition::Bottom);
     assert_eq!(app.navigator_stack_pct, 29, "the stacked share is remembered");
     press(&mut app, &keymap, KeyCode::Char('p'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Right);
+    assert_eq!(app.navigator_position, NavigatorPosition::Left);
     assert_eq!(app.navigator_side_pct, 36, "the side share is remembered");
 
     app.start_comment();
     press(&mut app, &keymap, KeyCode::Char('p'));
     assert_eq!(app.input, "p", "the position key is text in the composer");
-    assert_eq!(app.navigator_position, NavigatorPosition::Right);
+    assert_eq!(app.navigator_position, NavigatorPosition::Left);
     app.cancel_comment();
 
     app.mode = Mode::List;
@@ -1828,11 +1828,11 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
         "the comments list owns its footer"
     );
     press(&mut app, &keymap, KeyCode::Char('p'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Right, "the action is inert in list");
+    assert_eq!(app.navigator_position, NavigatorPosition::Left, "the action is inert in list");
     app.mode = Mode::Normal;
     app.set_tab(diple::app::Tab::Pr).unwrap();
     press(&mut app, &keymap, KeyCode::Char('p'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Bottom, "the action works on PR");
+    assert_eq!(app.navigator_position, NavigatorPosition::Top, "the action works on PR");
     assert!(
         app.footer_bands().iter().any(|&(a, _)| a == FooterAction::NavigatorPosition),
         "the PR footer exposes the position action"
@@ -1853,7 +1853,7 @@ fn navigator_hide_toggles_full_width_and_respects_modes() {
     assert_eq!(app.focus, Focus::Diff, "hiding moves focus to the read pane");
     press(&mut app, &keymap, KeyCode::Char('p'));
     press(&mut app, &keymap, KeyCode::Char('<'));
-    assert_eq!(app.navigator_position, NavigatorPosition::Right, "`p` is inert while hidden");
+    assert_eq!(app.navigator_position, NavigatorPosition::Left, "`p` is inert while hidden");
     assert_eq!(app.navigator_side_pct, 32, "`<` is inert while hidden");
     let body = diple::ui::body_rect(area, &app);
     let row = body.y + body.height / 2;
@@ -2063,21 +2063,21 @@ fn navigator_config_changes_override_only_when_the_config_value_changes() {
     let default = diple::config::AppConfig::default();
     app.set_app_config(default.clone());
     app.cycle_navigator_position();
-    assert_eq!(app.navigator_position, NavigatorPosition::Bottom);
+    assert_eq!(app.navigator_position, NavigatorPosition::Top);
 
     app.set_app_config(default);
     assert_eq!(
         app.navigator_position,
-        NavigatorPosition::Bottom,
+        NavigatorPosition::Top,
         "an unchanged config preserves the session override"
     );
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "navigator_position = \"left\"\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "navigator_position = \"right\"\n").unwrap();
     let changed = diple::config::app_config_in(dir.path()).unwrap();
     app.start_divider_drag();
     app.set_app_config(changed);
-    assert_eq!(app.navigator_position, NavigatorPosition::Left);
+    assert_eq!(app.navigator_position, NavigatorPosition::Right);
     assert!(app.divider_drag_cancelled(), "a config layout change cancels the old gesture");
 }
 

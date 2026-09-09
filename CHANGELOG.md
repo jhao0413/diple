@@ -4,6 +4,17 @@ All notable changes to Diple are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-09
+
+### Added
+
+- Responsive old/new source columns for wide Changes diffs, with unified rendering retained on
+  narrower panes.
+
+### Changed
+
+- The file navigator now defaults to the left of the read pane.
+
 ## [0.2.0] - 2026-09-09
 
 ### Added

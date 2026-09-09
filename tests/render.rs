@@ -55,11 +55,11 @@ const SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x58, 0x5
 /// Catppuccin orange — the comment-editor caret block.
 const PEACH: ratatui::style::Color = ratatui::style::Color::Rgb(0xfa, 0xb3, 0x87);
 
-/// The right `100-pct`% of every frame row, for pane-scoped assertions — one home for
+/// The left `pct`% of every frame row, for pane-scoped assertions — one home for
 /// the column math, so the two panes' cut points can't drift apart silently.
-fn right_column(out: &str, pct: usize) -> String {
+fn left_column(out: &str, pct: usize) -> String {
     out.lines()
-        .map(|l| l.chars().skip(l.chars().count() * pct / 100).collect::<String>())
+        .map(|l| l.chars().take(l.chars().count() * pct / 100).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -309,9 +309,9 @@ fn the_file_list_renders_as_a_directory_tree() {
     r.write("Cargo.toml", "[package]\nname='z'\n");
     let app = app_on(&r);
 
-    // Scan only the default-right navigator so the diff header — which does show
+    // Scan only the default-left navigator so the diff header — which does show
     // the open file's full path — doesn't confuse the assertions.
-    let files_pane = right_column(&render(&app), 70);
+    let files_pane = left_column(&render(&app), 32);
     assert!(files_pane.contains("src/"), "the directory groups its files: {files_pane:?}");
     assert!(files_pane.contains("app.rs") && files_pane.contains("ui.rs"), "files by basename");
     assert!(!files_pane.contains("src/app.rs"), "a grouped file is not shown by full path");
@@ -329,7 +329,7 @@ fn partially_staged_paths_render_in_both_named_sections() {
     let app = app_on(&r);
 
     let out = render(&app);
-    let files_pane = right_column(&out, 70);
+    let files_pane = left_column(&out, 32);
     assert!(out.contains("Staged Changes 1"), "{out}");
     assert!(out.contains("Changes 1"), "{out}");
     assert_eq!(
@@ -371,23 +371,24 @@ fn an_expanded_directory_nests_its_children() {
     app.expand_dir();
 
     let buf = render_buffer(&app);
-    // Search from the files pane so a left-pane path cannot steal the match.
-    let files_x0 = 140 - 140 * 32 / 100 + 1;
-    let src = token_x(&buf, "src/", files_x0);
-    let tests = token_x(&buf, "tests/", files_x0);
-    let readme = token_x(&buf, "README.md", files_x0);
-    let app_rs = token_x(&buf, "app.rs", files_x0);
+    // Search from the default-left files pane so a read-pane path cannot steal the match.
+    let files_inner = ui::files_inner_rect(AREA, &app);
+    let files = files_inner.x..files_inner.x + files_inner.width;
+    let src = token_x(&buf, "src/", files.clone());
+    let tests = token_x(&buf, "tests/", files.clone());
+    let readme = token_x(&buf, "README.md", files.clone());
+    let app_rs = token_x(&buf, "app.rs", files);
     assert_eq!(src, tests, "sibling directories share a name column");
     assert_eq!(src, readme, "a root file name lines up with a root directory");
     assert!(app_rs > src, "a child file sits to the right of its parent: {app_rs} vs {src}");
 }
 
-/// First painted column of `token` in `buf` at or after `x0`. Panics if it never appears.
-fn token_x(buf: &Buffer, token: &str, x0: u16) -> u16 {
+/// First painted column of `token` in `buf` within `columns`. Panics if it never appears.
+fn token_x(buf: &Buffer, token: &str, columns: std::ops::Range<u16>) -> u16 {
     let chars: Vec<char> = token.chars().collect();
     let n = chars.len() as u16;
     for y in 0..buf.area.height {
-        for x in x0..buf.area.width.saturating_sub(n) {
+        for x in columns.start..columns.end.saturating_sub(n) {
             let hit = (0..n).all(|i| {
                 buf.cell((x + i, y)).is_some_and(|c| c.symbol() == chars[i as usize].to_string())
             });
@@ -396,7 +397,7 @@ fn token_x(buf: &Buffer, token: &str, x0: u16) -> u16 {
             }
         }
     }
-    panic!("{token} was not painted at x>={x0}");
+    panic!("{token} was not painted in {columns:?}");
 }
 
 #[test]
@@ -524,6 +525,106 @@ fn horizontal_scroll_shifts_the_diff_left() {
 }
 
 #[test]
+fn a_wide_changes_pane_places_old_and_new_source_in_separate_lanes() {
+    let app = edited_app();
+    let wide = Rect::new(0, 0, 200, 24);
+    let narrow = Rect::new(0, 0, 160, 24);
+    let wide_inner = ui::read_inner_rect(wide, &app);
+    let narrow_inner = ui::read_inner_rect(narrow, &app);
+    let wide_buf = render_size(&app, wide.width, wide.height);
+    let narrow_buf = render_size(&app, narrow.width, narrow.height);
+    let line = |buf: &Buffer, inner: Rect, row: usize| {
+        (inner.x..inner.x + inner.width)
+            .map(|x| buf.cell((x, inner.y + row as u16)).unwrap().symbol())
+            .collect::<String>()
+    };
+    let context = app.visible.iter().position(|row| row.text() == "alpha").unwrap();
+    let deletion = app.visible.iter().position(|row| row.text() == "beta").unwrap();
+    let insertion = app.visible.iter().position(|row| row.text() == "BETA").unwrap();
+
+    let wide_context = line(&wide_buf, wide_inner, context);
+    let wide_deletion = line(&wide_buf, wide_inner, deletion);
+    let wide_insertion = line(&wide_buf, wide_inner, insertion);
+    let left_width = (wide_inner.width as usize - 1) / 2;
+    let midpoint = wide_inner.width as usize / 2;
+    assert_eq!(wide_context.matches("alpha").count(), 2, "wide context mirrors both sides");
+    assert!(wide_deletion.find("beta").unwrap() < midpoint, "deletion stays in the old lane");
+    assert!(wide_insertion.find("BETA").unwrap() > midpoint, "insertion stays in the new lane");
+    assert_eq!(wide_deletion.chars().nth(left_width), Some('│'), "a divider separates the lanes");
+
+    let narrow_context = line(&narrow_buf, narrow_inner, context);
+    let narrow_insertion = line(&narrow_buf, narrow_inner, insertion);
+    assert_eq!(narrow_context.matches("alpha").count(), 1, "narrow diff remains unified");
+    assert!(
+        narrow_insertion.find("BETA").unwrap() < narrow_inner.width as usize / 2,
+        "the unified insertion starts at the single gutter"
+    );
+}
+
+#[test]
+fn wide_diff_wrapping_and_pointer_mapping_use_the_source_lane_geometry() {
+    let r = Repo::init();
+    r.write("w.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("w.rs", &format!("alpha\n{}\n", "B".repeat(90)));
+    let app = app_on(&r);
+    let wide = Rect::new(0, 0, 200, 24);
+    let narrow = Rect::new(0, 0, 160, 24);
+    let insertion = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    assert!(ui::diff_row_heights(&app, wide)[insertion] > 1, "the new lane owns wrapping");
+    assert_eq!(
+        ui::diff_row_heights(&app, narrow)[insertion],
+        1,
+        "the same line fits the narrow unified pane"
+    );
+
+    // Repaint with short rows so each logical row has a stable one-line pointer target.
+    let app = edited_app();
+    let _ = render_size(&app, wide.width, wide.height);
+    let inner = ui::read_inner_rect(wide, &app);
+    let left_width = (usize::from(inner.width) - 1) / 2;
+    let left_code = inner.x + 5;
+    let right_gutter = inner.x + left_width as u16 + 1;
+    let right_code = right_gutter + 5;
+    let deletion = app.visible.iter().position(|row| row.marker() == '-').unwrap();
+    let insertion = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    let del_y = inner.y + deletion as u16;
+    let ins_y = inner.y + insertion as u16;
+
+    assert_eq!(ui::read_point_at(wide, &app, left_code, del_y).map(|p| p.row), Some(deletion));
+    assert_eq!(ui::read_point_at(wide, &app, right_code, del_y), None);
+    assert_eq!(ui::read_point_at(wide, &app, left_code, ins_y), None);
+    assert_eq!(ui::read_point_at(wide, &app, right_code, ins_y).map(|p| p.row), Some(insertion));
+    assert_eq!(ui::gutter_row_at(wide, &app, inner.x, del_y), Some(deletion));
+    assert_eq!(ui::gutter_row_at(wide, &app, right_gutter, del_y), None);
+    assert_eq!(ui::gutter_row_at(wide, &app, inner.x, ins_y), None);
+    assert_eq!(ui::gutter_row_at(wide, &app, right_gutter, ins_y), Some(insertion));
+
+    // At this width the old lane has one fewer code column. A context line can therefore
+    // wrap on the left while fitting on the right; the right-hand blank continuation is inert.
+    let r = Repo::init();
+    let context = "C".repeat(62);
+    r.write("uneven.rs", &format!("{context}\nbefore\n"));
+    r.commit_all("init");
+    r.write("uneven.rs", &format!("{context}\nafter\n"));
+    let uneven = app_on(&r);
+    let _ = render_size(&uneven, wide.width, wide.height);
+    let inner = ui::read_inner_rect(wide, &uneven);
+    let left_width = (usize::from(inner.width) - 1) / 2;
+    let context_row = uneven.visible.iter().position(|row| row.text() == context).unwrap();
+    let continuation_y = inner.y + 1;
+    assert_eq!(context_row, 0);
+    assert_eq!(
+        ui::read_point_at(wide, &uneven, inner.x + 5, continuation_y).map(|p| p.row),
+        Some(context_row)
+    );
+    assert_eq!(
+        ui::read_point_at(wide, &uneven, inner.x + left_width as u16 + 1 + 5, continuation_y,),
+        None
+    );
+}
+
+#[test]
 fn a_changed_word_gets_the_emphasis_background() {
     const EMPH_INS_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x30, 0x55, 0x3f);
     let r = Repo::init();
@@ -565,7 +666,10 @@ fn the_diff_cursor_row_is_marked_from_either_pane() {
     let fill = |app: &App, bg| {
         let buf = render_buffer(app);
         let y = cursor_y(app);
-        (1..40u16).filter(|&x| buf.cell((x, y)).is_some_and(|c| c.bg == bg)).count()
+        let inner = ui::read_inner_rect(AREA, app);
+        (inner.x..inner.x + inner.width)
+            .filter(|&x| buf.cell((x, y)).is_some_and(|c| c.bg == bg))
+            .count()
     };
 
     assert!(fill(&app, SELECTION_BG) > 10, "the focused diff fills its cursor row with surface2");
@@ -581,10 +685,10 @@ fn the_diff_cursor_row_is_marked_from_either_pane() {
 fn the_selected_file_row_fills_with_the_shared_selection_color() {
     let app = edited_app(); // one file below the uncommitted section header, Files focused
     let buf = render_buffer(&app);
-    // Files pane: right 32% of 140 cols; its border is at y=1, first content row at y=2.
-    let files_x0 = 140 - 140 * 32 / 100 + 1;
+    // The default-left Files pane has its border at y=1 and first content row at y=2.
+    let files = ui::files_inner_rect(AREA, &app);
     let selected_y = 2 + u16::try_from(app.file_cursor).unwrap();
-    let selected = (files_x0..139)
+    let selected = (files.x..files.x + files.width)
         .filter(|&x| buf.cell((x, selected_y)).is_some_and(|c| c.bg == SELECTION_BG))
         .count();
     assert!(selected > 10, "the selected file row fills wide with surface2: {selected} cells");
@@ -607,10 +711,12 @@ fn a_hidden_navigator_gives_the_read_pane_the_whole_body() {
     assert!(!out.contains("z hide"), "visible and collapsed, the hide key waits under `?`");
 
     app.toggle_navigator_hidden();
+    let hidden_width = ui::read_inner_rect(AREA, &app).width;
     let hidden_fill = fill(&app);
     assert!(
-        hidden_fill > visible_fill && hidden_fill > 120,
-        "the cursor row fills the whole body with surface2: {hidden_fill} vs {visible_fill}"
+        hidden_width > 130 && hidden_fill > 60,
+        "the read pane takes the body and its split source lane remains selected: width \
+         {hidden_width}, fill {hidden_fill} vs {visible_fill}"
     );
     let out = render(&app);
     assert!(out.contains("z show"), "the collapsed footer names the way back");
@@ -1104,6 +1210,12 @@ fn the_box_is_inserted_under_the_selected_line() {
 const AREA: Rect = Rect { x: 0, y: 0, width: 140, height: 40 };
 
 #[test]
+fn a_fresh_pane_defaults_the_navigator_to_the_left() {
+    let app = App::new(std::path::PathBuf::from("."), Scope::Uncommitted, None);
+    assert_eq!(app.navigator_position, NavigatorPosition::Left);
+}
+
+#[test]
 fn header_clicks_map_to_the_scope_chip() {
     let app = edited_app(); // scope uncommitted, no comments
     // Scan the header row instead of hardcoding columns, so the test survives changes
@@ -1130,28 +1242,28 @@ fn header_clicks_map_to_the_scope_chip() {
 #[test]
 fn file_and_diff_clicks_map_to_row_indices() {
     let app = edited_app();
-    // Right pane: the first file row maps to index 0; clicking past the list misses.
-    assert_eq!(ui::hit_file(AREA, &app, 120, 2, app.file_rows.len(), 0), Some(0));
-    assert_eq!(ui::hit_file(AREA, &app, 120, 9, app.file_rows.len(), 0), None);
+    // Left pane: the first file row maps to index 0; clicking past the list misses.
+    assert_eq!(ui::hit_file(AREA, &app, 10, 2, app.file_rows.len(), 0), Some(0));
+    assert_eq!(ui::hit_file(AREA, &app, 10, 9, app.file_rows.len(), 0), None);
     // With the list scrolled down, the top visible row maps to that scrolled-to index.
-    assert_eq!(ui::hit_file(AREA, &app, 120, 2, 50, 7), Some(7));
-    assert_eq!(ui::hit_file(AREA, &app, 120, 3, 50, 7), Some(8));
+    assert_eq!(ui::hit_file(AREA, &app, 10, 2, 50, 7), Some(7));
+    assert_eq!(ui::hit_file(AREA, &app, 10, 3, 50, 7), Some(8));
     // The wheel routes by pointer: a column in the navigator is "in" the file list,
     // one in the read pane is not.
-    assert!(ui::in_files_pane(AREA, &app, 120, 3));
-    assert!(!ui::in_files_pane(AREA, &app, 10, 3));
-    // Left pane: diff rows map top-down to diff-line indices.
+    assert!(ui::in_files_pane(AREA, &app, 10, 3));
+    assert!(!ui::in_files_pane(AREA, &app, 120, 3));
+    // Right pane: diff rows map top-down to diff-line indices.
     assert!(app.visible.len() > 1);
     let heights = ui::diff_row_heights(&app, AREA);
-    assert_eq!(ui::hit_diff(AREA, &app, 10, 2, &heights, 0), Some(0));
-    assert_eq!(ui::hit_diff(AREA, &app, 10, 3, &heights, 0), Some(1));
+    assert_eq!(ui::hit_diff(AREA, &app, 120, 2, &heights, 0), Some(0));
+    assert_eq!(ui::hit_diff(AREA, &app, 120, 3, &heights, 0), Some(1));
     // With a nonzero scroll and wrapped (multi-row) lines, the click must skip the
     // scrolled-off rows and account for each visible row's display height. Rows are
     // 2 tall each; diff_scroll=1 puts row index 1 at the top of the pane (inner.y == 2).
     let tall = [2usize, 2, 2, 2];
-    assert_eq!(ui::hit_diff(AREA, &app, 10, 2, &tall, 1), Some(1)); // top visible row
-    assert_eq!(ui::hit_diff(AREA, &app, 10, 3, &tall, 1), Some(1)); // its second display row
-    assert_eq!(ui::hit_diff(AREA, &app, 10, 4, &tall, 1), Some(2)); // next logical row
+    assert_eq!(ui::hit_diff(AREA, &app, 120, 2, &tall, 1), Some(1)); // top visible row
+    assert_eq!(ui::hit_diff(AREA, &app, 120, 3, &tall, 1), Some(1)); // its second display row
+    assert_eq!(ui::hit_diff(AREA, &app, 120, 4, &tall, 1), Some(2)); // next logical row
 }
 
 #[test]
@@ -1586,7 +1698,7 @@ fn pr_bodies_render_as_markdown_and_the_description_row_pins_first() {
     assert!(!out.contains("*markdown*"), "emphasis markers are consumed:\n{out}");
 
     // The navigator orders the PR itself first: description above checks above comments.
-    let nav = right_column(&out, 68);
+    let nav = left_column(&out, 32);
     let desc_at = nav.find("description").expect("description row in the nav");
     let checks_at = nav.find("checks").expect("checks section in the nav");
     let comments_at = nav.find("comments ·").expect("comments header in the nav");
@@ -1699,7 +1811,7 @@ fn pr_nav_clicks_map_the_description_and_comment_rows() {
     // resolves through the display-row map and the row's cursor, the same pair the release
     // path uses.
     let area = Rect::new(0, 0, 140, 40);
-    let x = 130; // inside the nav pane
+    let x = 10; // inside the default-left nav pane
     let hit = |app: &App, y: u16| {
         ui::pr_nav_display_row(area, app, x, y, false)
             .and_then(|row| ui::pr_nav_cursor_at(app, row))

@@ -3447,7 +3447,7 @@ mod refresh_tests {
         std::fs::write(&path, "theme = \"nord\"\n").unwrap();
         let themed = app_config_in(dir.path()).unwrap();
         assert!(super::config_ends_gesture(&previous, Some(&themed)));
-        std::fs::write(&path, "theme = \"gruvbox\"\nnavigator_position = \"left\"\n").unwrap();
+        std::fs::write(&path, "theme = \"gruvbox\"\nnavigator_position = \"right\"\n").unwrap();
         let moved = app_config_in(dir.path()).unwrap();
         assert!(super::config_ends_gesture(&previous, Some(&moved)));
         assert!(super::config_ends_gesture(&previous, None));

@@ -22,13 +22,24 @@ particular AI workflow.
 
 ## Install
 
-From crates.io:
+With Homebrew on macOS or Linux:
 
 ```sh
-cargo install diple
+brew install jhao0413/tap/diple
 ```
 
-Or download a binary from the [latest GitHub release](https://github.com/jhao0413/diple/releases/latest).
+With Cargo directly from the source repository:
+
+```sh
+cargo install --git https://github.com/jhao0413/diple
+```
+
+Prebuilt binaries and SHA-256 checksums are also available from the
+[latest GitHub release](https://github.com/jhao0413/diple/releases/latest) for Apple Silicon,
+Intel macOS, x86-64 Linux, and ARM64 Linux.
+
+`cargo install diple` will be added after the crate is published to crates.io; the Git and
+Homebrew methods above are available independently of that registry publication.
 
 ## Use
 

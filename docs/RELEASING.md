@@ -17,3 +17,18 @@ attaches checksums and provenance, then publishes the release after every target
    ```
 
 The release workflow publishes `diple-<target>.tar.gz` and a SHA-256 sidecar for each target.
+
+The public `jhao0413/homebrew-tap` repository reads those release assets and updates
+`Formula/diple.rb` from its own `sync.yml` workflow. After a release, trigger it immediately:
+
+```sh
+gh workflow run sync.yml --repo jhao0413/homebrew-tap
+```
+
+Its scheduled run is the fallback. Verify the published formula with:
+
+```sh
+brew update
+brew install jhao0413/tap/diple
+diple --version
+```

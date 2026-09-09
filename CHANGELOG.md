@@ -13,6 +13,8 @@ All notable changes to Diple are documented here. The format follows
 - `a` stages or unstages the selected path while preserving the worktree.
 - Explicit send confirmation followed by a clean stdout review payload.
 - TUI output through the controlling terminal when stdout is captured.
+- Non-interactive `--help` and `--version` commands for package-manager verification.
+- Homebrew installation through `jhao0413/tap/diple`.
 
 ### Removed
 

@@ -11,7 +11,7 @@ env:
 
 jobs:
   check:
-    name: fmt · clippy · test
+    name: Linux · fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -28,6 +28,23 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Build (release)
+        run: cargo build --release
+
+  windows:
+    name: Windows · test · build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Test
         run: cargo test --all-features

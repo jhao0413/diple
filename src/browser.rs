@@ -7,20 +7,29 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 
-/// Platform openers, tried in order: macOS `open`, then the Linux `xdg-open`.
-const OPENERS: &[&str] = &["open", "xdg-open"];
+/// The host's default-URL handlers. Windows' `rundll32` call passes the URL as its own argv item,
+/// so shell metacharacters in a valid HTTP URL are never evaluated by `cmd.exe`.
+const OPENERS: &[(&str, &[&str])] = &[
+    #[cfg(windows)]
+    ("rundll32.exe", &["url.dll,FileProtocolHandler"]),
+    #[cfg(target_os = "macos")]
+    ("open", &[]),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    ("xdg-open", &[]),
+];
 
 /// Open `url` in the default browser via the first available opener. Errors when none is on
 /// `PATH` (the caller surfaces it to the status line). The opener hands the URL to the browser
 /// and exits at once, so this waits for it — reaping the child rather than leaving a zombie, and
 /// returning fast enough for a click handler (mirrors the codebase's synchronous tool calls).
 pub fn open(url: &str) -> Result<()> {
-    let tool = OPENERS
+    let (tool, args) = OPENERS
         .iter()
         .copied()
-        .find(|t| crate::proc::on_path(t))
-        .context("no URL opener found (need `open` or `xdg-open`)")?;
+        .find(|(tool, _)| crate::proc::on_path(tool))
+        .context("no platform URL opener found")?;
     let status = crate::proc::command(tool)
+        .args(args)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

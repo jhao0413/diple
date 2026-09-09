@@ -4,10 +4,14 @@
 //! diff snippet, then the text. Export is consume-on-success: the caller removes
 //! a comment only after `export` returns `Ok`.
 
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::process::Stdio;
 
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context, Result};
 
 use crate::model::Comment;
 
@@ -50,9 +54,10 @@ fn counted_comments(count: usize) -> String {
     format!("{count} {noun}")
 }
 
-/// A clipboard tool and the args that make it read stdin into the system clipboard. Tried in
-/// order — the first one present on `PATH` wins. macOS ships `pbcopy`; Linux needs one of these
-/// installed (Wayland `wl-copy`, or X11 `xclip`/`xsel`). OSC 52 and Windows are roadmap.
+/// A Unix clipboard tool and the args that make it read stdin into the system clipboard. Tried
+/// in order — the first one present on `PATH` wins. Windows uses its Unicode clipboard API
+/// directly below.
+#[cfg(unix)]
 const CLIPBOARD_TOOLS: &[(&str, &[&str])] = &[
     ("pbcopy", &[]),
     ("wl-copy", &[]),
@@ -78,29 +83,40 @@ impl ExportTarget for Clipboard {
     }
 
     fn export(&self, text: &str) -> Result<()> {
-        let (cmd, args) = select_tool(CLIPBOARD_TOOLS, crate::proc::on_path).context(
-            "no clipboard tool found (install wl-clipboard, xclip, or xsel) — \
-             use Send instead",
-        )?;
-        let mut child = crate::proc::command(cmd)
-            .args(args)
-            .stdin(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("spawning {cmd}"))?;
-        child
-            .stdin
-            .as_mut()
-            .with_context(|| format!("{cmd} stdin unavailable"))?
-            .write_all(text.as_bytes())
-            .with_context(|| format!("writing to {cmd}"))?;
-        if !child.wait().with_context(|| format!("waiting for {cmd}"))?.success() {
-            bail!("{cmd} exited non-zero");
-        }
-        Ok(())
+        export_clipboard(text)
     }
 }
 
+#[cfg(windows)]
+fn export_clipboard(text: &str) -> Result<()> {
+    clipboard_win::set_clipboard_string(text).context("setting the Windows clipboard")
+}
+
+#[cfg(unix)]
+fn export_clipboard(text: &str) -> Result<()> {
+    let (cmd, args) = select_tool(CLIPBOARD_TOOLS, crate::proc::on_path).context(
+        "no clipboard tool found (install wl-clipboard, xclip, or xsel) — \
+             use Send instead",
+    )?;
+    let mut child = crate::proc::command(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {cmd}"))?;
+    child
+        .stdin
+        .as_mut()
+        .with_context(|| format!("{cmd} stdin unavailable"))?
+        .write_all(text.as_bytes())
+        .with_context(|| format!("writing to {cmd}"))?;
+    if !child.wait().with_context(|| format!("waiting for {cmd}"))?.success() {
+        bail!("{cmd} exited non-zero");
+    }
+    Ok(())
+}
+
 /// The first clipboard tool the `present` predicate accepts, preserving list order.
+#[cfg(unix)]
 fn select_tool(
     tools: &'static [(&'static str, &'static [&'static str])],
     present: impl Fn(&str) -> bool,
@@ -110,12 +126,13 @@ fn select_tool(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, select_tool,
-    };
+    #[cfg(unix)]
+    use super::{CLIPBOARD_TOOLS, select_tool};
+    use super::{Clipboard, ExportTarget, format_all, format_comment};
     use crate::model::{Comment, Side};
 
     #[test]
+    #[cfg(unix)]
     fn clipboard_tool_selection_prefers_list_order_and_can_be_empty() {
         // None present -> no tool (the caller surfaces the "install one" error).
         assert!(select_tool(CLIPBOARD_TOOLS, |_| false).is_none());

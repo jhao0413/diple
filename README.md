@@ -28,6 +28,12 @@ With Homebrew on macOS or Linux:
 brew install jhao0413/tap/diple
 ```
 
+With WinGet on Windows (available after the initial community manifest is indexed):
+
+```powershell
+winget install --id Jhao0413.Diple -e
+```
+
 With Cargo directly from the source repository:
 
 ```sh
@@ -36,7 +42,7 @@ cargo install --git https://github.com/jhao0413/diple
 
 Prebuilt binaries and SHA-256 checksums are also available from the
 [latest GitHub release](https://github.com/jhao0413/diple/releases/latest) for Apple Silicon,
-Intel macOS, x86-64 Linux, and ARM64 Linux.
+Intel macOS, x86-64 Linux, ARM64 Linux, and x86-64 Windows.
 
 `cargo install diple` will be added after the crate is published to crates.io; the Git and
 Homebrew methods above are available independently of that registry publication.
@@ -65,7 +71,7 @@ printf '%s\n' "$review"
 ```
 
 When stdout is captured, Diple draws the TUI through the controlling terminal (`/dev/tty` on
-Unix) so terminal escape sequences never enter the captured review.
+Unix or the console on Windows) so terminal escape sequences never enter the captured review.
 
 Press `q` to quit without emitting anything. Press `y` to copy comments without exiting.
 

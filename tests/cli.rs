@@ -8,7 +8,10 @@ fn help_and_version_need_no_terminal() {
 
     let version = Command::new(binary).arg("--version").output().expect("run --version");
     assert!(version.status.success());
-    assert_eq!(String::from_utf8_lossy(&version.stdout), "diple 0.1.0\n");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        format!("diple {}\n", env!("CARGO_PKG_VERSION"))
+    );
     assert!(version.stderr.is_empty());
 
     let help = Command::new(binary).arg("--help").output().expect("run --help");

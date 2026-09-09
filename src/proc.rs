@@ -5,43 +5,72 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Usual host bin dirs a stripped pane PATH may omit.
+/// Usual Unix host bin dirs a stripped pane PATH may omit. Windows inherits its PATH unchanged:
+/// adding Unix spellings there would create relative drive paths rather than useful fallbacks.
+#[cfg(unix)]
 const COMMON_BINS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+#[cfg(windows)]
+const COMMON_BINS: &[&str] = &[];
 
 fn host_path() -> OsString {
     prepended_path(env::var_os("PATH").as_deref())
 }
 
 fn prepended_path(inherited: Option<&OsStr>) -> OsString {
-    let mut path = OsString::from(COMMON_BINS.join(":"));
-    if let Some(inherited) = inherited
-        && !inherited.is_empty()
-    {
-        path.push(":");
-        path.push(inherited);
-    }
-    path
+    join_paths(COMMON_BINS.iter().map(PathBuf::from).chain(path_entries(inherited)), inherited)
 }
 
 fn appended_path(inherited: Option<&OsStr>) -> OsString {
-    let Some(inherited) = inherited.filter(|p| !p.is_empty()) else {
-        return OsString::from(COMMON_BINS.join(":"));
-    };
-    let mut path = inherited.to_os_string();
-    path.push(":");
-    path.push(COMMON_BINS.join(":"));
-    path
+    join_paths(path_entries(inherited).chain(COMMON_BINS.iter().map(PathBuf::from)), inherited)
+}
+
+fn path_entries(path: Option<&OsStr>) -> impl Iterator<Item = PathBuf> + '_ {
+    path.filter(|p| !p.is_empty()).into_iter().flat_map(env::split_paths)
+}
+
+fn join_paths(entries: impl IntoIterator<Item = PathBuf>, fallback: Option<&OsStr>) -> OsString {
+    // Entries produced by `split_paths` and the static fallbacks are valid path-list members.
+    // Preserve the inherited spelling only as a defensive fallback for an unusual host value.
+    env::join_paths(entries).unwrap_or_else(|_| fallback.unwrap_or_default().to_os_string())
+}
+
+fn executable_file(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        // `Command` honors PATHEXT on Windows; mirror the standard executable suffixes here so
+        // probes and editor lookup make the same choice. Include the defaults even when a
+        // customized PATHEXT accidentally omits one.
+        const DEFAULT_EXTENSIONS: &[&str] = &[".COM", ".EXE", ".BAT", ".CMD"];
+        let configured = env::var("PATHEXT").unwrap_or_default();
+        for extension in configured.split(';').chain(DEFAULT_EXTENSIONS.iter().copied()) {
+            if extension.is_empty() {
+                continue;
+            }
+            let extension = if extension.starts_with('.') {
+                extension.to_owned()
+            } else {
+                format!(".{extension}")
+            };
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(extension);
+            let candidate = PathBuf::from(candidate);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn resolve_on(path: &OsStr, name: &OsStr) -> Option<PathBuf> {
     let as_path = Path::new(name);
     if as_path.is_absolute() || as_path.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
-        return as_path.is_file().then(|| as_path.to_path_buf());
+        return executable_file(as_path);
     }
-    env::split_paths(path).find_map(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file().then_some(candidate)
-    })
+    env::split_paths(path).find_map(|dir| executable_file(&dir.join(name)))
 }
 
 /// Resolve `program` on the host PATH — the common host bins first, the inherited PATH after —
@@ -74,9 +103,9 @@ pub(crate) fn user_command(program: impl AsRef<OsStr>) -> Option<Command> {
     Some(cmd)
 }
 
-/// Whether `name` resolves to an executable on the host PATH — a dependency-free `which`. Both
-/// shipped platforms are unix, so a file in a host-PATH directory is the executable. Shared by
-/// the clipboard probe (`export.rs`) and the URL-opener probe (`browser.rs`).
+/// Whether `name` resolves to an executable on the host PATH — a dependency-free `which` that
+/// also honors Windows executable suffixes. Shared by the clipboard probe (`export.rs`) and the
+/// URL-opener probe (`browser.rs`).
 #[must_use]
 pub fn on_path(name: &str) -> bool {
     resolve_on(&host_path(), OsStr::new(name)).is_some()
@@ -87,14 +116,16 @@ mod tests {
     use super::{COMMON_BINS, appended_path, prepended_path, resolve_on};
     use std::env;
     use std::ffi::OsStr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn prepended_path_puts_the_common_bins_in_front_of_the_inherited_path() {
-        let got = prepended_path(Some(OsStr::new("/usr/bin:/bin")));
+        let inherited = [PathBuf::from("inherited-one"), PathBuf::from("inherited-two")];
+        let inherited_path = env::join_paths(&inherited).unwrap();
+        let got = prepended_path(Some(&inherited_path));
         let parts: Vec<PathBuf> = env::split_paths(&got).collect();
         let mut expected: Vec<PathBuf> = COMMON_BINS.iter().map(PathBuf::from).collect();
-        expected.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        expected.extend(inherited);
         assert_eq!(parts, expected);
     }
 
@@ -110,9 +141,11 @@ mod tests {
     fn appended_path_leaves_the_reviewers_own_entries_in_front() {
         // The editor's own tools have to resolve the way its shell would resolve them, so a
         // version-managed shim wins and the common bins only backstop a stripped PATH.
-        let got = appended_path(Some(OsStr::new("/me/.mise/shims:/usr/bin")));
+        let inherited = [PathBuf::from("reviewer-first"), PathBuf::from("reviewer-second")];
+        let inherited_path = env::join_paths(&inherited).unwrap();
+        let got = appended_path(Some(&inherited_path));
         let parts: Vec<PathBuf> = env::split_paths(&got).collect();
-        let mut expected = vec![PathBuf::from("/me/.mise/shims"), PathBuf::from("/usr/bin")];
+        let mut expected = inherited.to_vec();
         expected.extend(COMMON_BINS.iter().map(PathBuf::from));
         assert_eq!(parts, expected);
 
@@ -127,9 +160,9 @@ mod tests {
     #[test]
     fn resolve_on_finds_a_bare_name_in_a_path_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("gh");
+        let bin = dir.path().join(if cfg!(windows) { "gh.exe" } else { "gh" });
         std::fs::write(&bin, []).unwrap();
-        let path = env::join_paths([dir.path(), PathBuf::from("/usr/bin").as_path()]).unwrap();
+        let path = env::join_paths([dir.path(), Path::new("elsewhere")]).unwrap();
         assert_eq!(resolve_on(&path, OsStr::new("gh")).as_deref(), Some(bin.as_path()));
         assert!(resolve_on(&path, OsStr::new("missing")).is_none());
     }

@@ -1683,7 +1683,10 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let canonical = std::fs::canonicalize(repo.path()).unwrap();
-        assert_eq!(worktree_of(repo.path()), Worktree::Root(canonical));
+        let Worktree::Root(root) = worktree_of(repo.path()) else {
+            panic!("initialized repository must resolve to a worktree");
+        };
+        assert_eq!(std::fs::canonicalize(root).unwrap(), canonical);
     }
 
     #[test]

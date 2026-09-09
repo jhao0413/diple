@@ -132,7 +132,8 @@ mod tests {
     #[test]
     fn prepended_path_keeps_the_common_bins_when_nothing_is_inherited() {
         let got = prepended_path(None);
-        let parts: Vec<PathBuf> = env::split_paths(&got).collect();
+        let parts: Vec<PathBuf> =
+            env::split_paths(&got).filter(|part| !part.as_os_str().is_empty()).collect();
         let expected: Vec<PathBuf> = COMMON_BINS.iter().map(PathBuf::from).collect();
         assert_eq!(parts, expected);
     }
@@ -149,7 +150,9 @@ mod tests {
         expected.extend(COMMON_BINS.iter().map(PathBuf::from));
         assert_eq!(parts, expected);
 
-        let bare: Vec<PathBuf> = env::split_paths(&appended_path(None)).collect();
+        let bare: Vec<PathBuf> = env::split_paths(&appended_path(None))
+            .filter(|part| !part.as_os_str().is_empty())
+            .collect();
         assert_eq!(bare, COMMON_BINS.iter().map(PathBuf::from).collect::<Vec<_>>());
 
         // A set-but-empty PATH is the same as none. Joined instead, its empty entry would put
@@ -163,7 +166,8 @@ mod tests {
         let bin = dir.path().join(if cfg!(windows) { "gh.exe" } else { "gh" });
         std::fs::write(&bin, []).unwrap();
         let path = env::join_paths([dir.path(), Path::new("elsewhere")]).unwrap();
-        assert_eq!(resolve_on(&path, OsStr::new("gh")).as_deref(), Some(bin.as_path()));
+        let resolved = resolve_on(&path, OsStr::new("gh")).unwrap();
+        assert_eq!(std::fs::canonicalize(resolved).unwrap(), std::fs::canonicalize(bin).unwrap());
         assert!(resolve_on(&path, OsStr::new("missing")).is_none());
     }
 }

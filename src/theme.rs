@@ -49,6 +49,8 @@ pub struct Palette {
     pub surface0: Color,
     pub surface1: Color,
     pub surface2: Color,
+    /// The active cursor-row fill: a clean, restrained tint distinct from neutral surfaces.
+    pub focus_bg: Color,
     pub dim2: Color,
     pub dim1: Color,
     pub dim0: Color,
@@ -66,17 +68,23 @@ pub struct Palette {
     /// The search match highlight: a warm fill behind a matched substring, legible over a
     /// plain row, a syntax-colored row, and the preview's banded hit line alike.
     pub match_hl: Color,
-    /// The text-selection highlight, live and settled: a cool fill distinct by hue from the
-    /// `surface1`/`surface2` row fills, so a selection reads inside a cursor row in any pane
+    /// The text-selection highlight, live and settled: a stronger cool fill distinct from the
+    /// cursor-row tint, so a selection reads inside a cursor row in any pane.
     pub sel_bg: Color,
 }
 
 impl Palette {
-    /// The cursor-row fill: the strongest-contrast surface (`surface2`) in the focused pane, a
-    /// step softer (`surface1`) when not, so which pane holds the cursor reads at a glance.
-    /// ("Strongest", not "brightest": light themes step surfaces toward black, not white.)
+    /// A quiet structural gray for workspace panes. Dark themes deliberately use the terminal's
+    /// neutral ANSI gray instead of a chromatic theme surface; light themes keep their pale
+    /// derived surface so the outline does not become disproportionately heavy.
+    pub fn pane_border(&self) -> Color {
+        if luminance(self.text) < luminance(self.base) { self.surface2 } else { Color::DarkGray }
+    }
+
+    /// The cursor-row fill: a clean cool tint in the focused pane, a quiet neutral surface when
+    /// not, so which pane holds the cursor reads at a glance without a muddy full-gray highlight.
     pub fn cursor_bg(&self, focused: bool) -> Color {
-        if focused { self.surface2 } else { self.surface1 }
+        if focused { self.focus_bg } else { self.surface1 }
     }
 
     /// Lift a painted color onto a selection fill. The dim role (`dim2`) sits one surface
@@ -182,6 +190,7 @@ fn catppuccin() -> Theme {
             surface0: Color::Rgb(0x31, 0x32, 0x44),
             surface1: Color::Rgb(0x45, 0x47, 0x5a),
             surface2: Color::Rgb(0x58, 0x5b, 0x70),
+            focus_bg: Color::Rgb(0x2a, 0x2e, 0x58),
             dim2: Color::Rgb(0x6c, 0x70, 0x86),
             dim1: Color::Rgb(0x7f, 0x84, 0x9c),
             dim0: Color::Rgb(0xa6, 0xad, 0xc8),
@@ -315,6 +324,7 @@ fn derive(a: Anchors, appearance: Appearance) -> Palette {
         surface0: surface(0.045),
         surface1: surface(0.09),
         surface2: surface(0.14),
+        focus_bg: cursor_tint(a.blue, a.base, a.text, appearance),
         dim2: surface(0.26),
         dim1: surface(0.34),
         dim0: blend(a.text, a.base, 0.18),
@@ -330,7 +340,7 @@ fn derive(a: Anchors, appearance: Appearance) -> Palette {
         emph_del_bg: readable_tint(a.red, a.base, a.text, appearance, true),
         emph_ins_bg: readable_tint(a.green, a.base, a.text, appearance, true),
         match_hl: readable_tint(a.yellow, a.base, a.text, appearance, true),
-        sel_bg: readable_tint(saturated(a.blue), a.base, a.text, appearance, true),
+        sel_bg: selection_tint(a.blue, a.base, a.text, appearance),
     }
 }
 
@@ -340,6 +350,42 @@ const BLACK: Color = Color::Rgb(0x00, 0x00, 0x00);
 /// The lowest contrast a diff fill keeps against the row's text, so code on a fill stays
 /// legible on any base.
 const MIN_FILL_CONTRAST: f64 = 4.5;
+
+/// A restrained, unmistakably chromatic cursor fill. Pulling the readable blue tint one step
+/// toward the base keeps it quieter than the stronger text-selection fill even when a theme's
+/// contrast ceiling makes both readable-tint searches stop at the same strength.
+fn cursor_tint(accent: Color, base: Color, fg: Color, appearance: Appearance) -> Color {
+    match appearance {
+        Appearance::Dark => {
+            let readable = readable_tint(saturated(accent), base, fg, appearance, false);
+            blend(base, readable, 0.72)
+        }
+        Appearance::Light => light_cool_tint(accent, fg, false),
+    }
+}
+
+/// The stronger companion to [`cursor_tint`] for character-precise text selection.
+fn selection_tint(accent: Color, base: Color, fg: Color, appearance: Appearance) -> Color {
+    match appearance {
+        Appearance::Dark => readable_tint(saturated(accent), base, fg, appearance, true),
+        Appearance::Light => light_cool_tint(accent, fg, true),
+    }
+}
+
+/// A pale blue mixed down from white for light appearances. Tinting a light base toward a dark
+/// blue can reduce contrast with dark text; starting at white preserves contrast while still
+/// giving cursor and text selection visibly different cool hues.
+fn light_cool_tint(accent: Color, fg: Color, strong: bool) -> Color {
+    let mut t = if strong { 0.18 } else { 0.09 };
+    while t > 0.0 {
+        let fill = blend(WHITE, saturated(accent), t);
+        if contrast(fg, fill) >= MIN_FILL_CONTRAST {
+            return fill;
+        }
+        t -= 0.01;
+    }
+    WHITE
+}
 
 /// A diff-row fill: tint `base` with `accent`, stepping the tint down from its start strength
 /// until the row's `fg` clears [`MIN_FILL_CONTRAST`]. `strong` is the brighter word-emphasis
@@ -446,9 +492,11 @@ mod tests {
         assert_eq!(p.dim0, Color::Rgb(0xa6, 0xad, 0xc8));
         assert_eq!(p.dim1, Color::Rgb(0x7f, 0x84, 0x9c));
         assert_eq!(p.dim2, Color::Rgb(0x6c, 0x70, 0x86));
+        assert_eq!(p.focus_bg, Color::Rgb(0x2a, 0x2e, 0x58));
         // The selection fill: saturated `blue` tinted over `base` at emphasis strength — a
-        // real hue, nothing near the gray `surface1`/`surface2` cursor fills.
+        // stronger than the focused cursor tint, so a dragged selection stays distinct.
         assert_eq!(p.sel_bg, Color::Rgb(0x35, 0x3d, 0x7d));
+        assert_eq!(p.pane_border(), Color::DarkGray);
     }
 
     #[test]
@@ -460,7 +508,9 @@ mod tests {
 
     #[test]
     fn latte_is_a_selectable_light_theme() {
-        assert_eq!(resolve(Some("catppuccin-latte")).name, "catppuccin-latte");
+        let theme = resolve(Some("catppuccin-latte"));
+        assert_eq!(theme.name, "catppuccin-latte");
+        assert_eq!(theme.palette.pane_border(), theme.palette.surface2);
     }
 
     #[test]
@@ -519,7 +569,12 @@ mod tests {
     fn every_theme_keeps_diff_fills_legible() {
         for &(name, _) in NAMED {
             let p = resolve(Some(name)).palette;
-            for fill in [p.del_bg, p.ins_bg, p.emph_del_bg, p.emph_ins_bg, p.sel_bg] {
+            assert_ne!(p.focus_bg, p.surface2, "{name}: focused cursor must not be neutral gray");
+            assert_ne!(
+                p.focus_bg, p.sel_bg,
+                "{name}: cursor and text selection must stay distinct"
+            );
+            for fill in [p.del_bg, p.ins_bg, p.emph_del_bg, p.emph_ins_bg, p.focus_bg, p.sel_bg] {
                 assert!(
                     contrast(p.text, fill) >= MIN_FILL_CONTRAST,
                     "{name}: fill {fill:?} drops below the legibility floor",

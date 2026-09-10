@@ -35,6 +35,8 @@ const BASE_PROBE_DELAY: Duration = Duration::from_millis(150);
 const DEFAULT_SEARCH_PCT: u16 = 50;
 const MIN_SEARCH_PCT: u16 = 10;
 const MAX_SEARCH_PCT: u16 = 90;
+/// Keep the History workspace quick even in repositories with very long-lived refs.
+pub(crate) const HISTORY_LIMIT: usize = 200;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DividerDrag {
@@ -60,12 +62,13 @@ enum Anchor {
     Dir(String),
 }
 
-/// Which top-level tab is active: the changes reviewer, the whole-repo browser, or the
-/// read-only PR mirror.
+/// Which top-level tab is active. `Pr` remains an internal, unreachable compatibility surface;
+/// the visible workspaces are Changes, Files, and History.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Changes,
     AllFiles,
+    History,
     Pr,
 }
 
@@ -81,7 +84,7 @@ pub enum RefreshKind {
 
 impl Tab {
     /// Whether this tab uses the file-tree / diff machinery (and so the per-tab stash). The
-    /// `PR` tab does not — it holds its own state and never swaps into the diff fields.
+    /// History and the internal PR surface hold their own state and never swap into these fields.
     pub(crate) fn is_file_tab(self) -> bool {
         matches!(self, Tab::Changes | Tab::AllFiles)
     }
@@ -303,6 +306,35 @@ impl CommitPicker {
         let newest = self.list_row(top)?;
         let oldest = self.list_row(bottom)?;
         Some(CommitPick { oldest: oldest.sha.clone(), newest: newest.sha.clone() })
+    }
+}
+
+/// Persistent place state for the read-only repository History workspace.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryView {
+    pub lines: Vec<git::HistoryLine>,
+    /// The selected physical graph line. It always names a commit when one exists.
+    pub cursor: usize,
+    /// The first visible physical graph line.
+    pub scroll: usize,
+    /// A keyboard/click move asks the next frame to reveal the selected row; wheel scrolling does
+    /// not, so reading away from the selection remains possible.
+    pub reveal: bool,
+}
+
+impl HistoryView {
+    #[must_use]
+    pub fn commit_count(&self) -> usize {
+        self.lines.iter().filter(|line| line.commit.is_some()).count()
+    }
+
+    #[must_use]
+    pub fn selected_sha(&self) -> Option<&str> {
+        self.lines.get(self.cursor)?.commit.as_ref().map(|commit| commit.sha.as_str())
+    }
+
+    fn first_commit(&self) -> usize {
+        self.lines.iter().position(|line| line.commit.is_some()).unwrap_or(0)
     }
 }
 
@@ -611,6 +643,8 @@ pub struct App {
     pub pick_status: Option<PickStatus>,
     /// The commit picker's rows, highlight, and anchor while `Mode::CommitPick` is open
     pub commit_picker: Option<CommitPicker>,
+    /// The bounded all-ref commit graph and its independent cursor/scroll place.
+    pub history: HistoryView,
     /// Bumped by each pick made in this pane, so an in-flight build that read the old pick
     /// fails the landing's input match instead of reverting the pick (`crate::world::WorldInput`).
     base_epoch: u64,
@@ -618,8 +652,8 @@ pub struct App {
     /// The active tab; it drives both panes and selects the per-tab state in play.
     pub tab: Tab,
     /// Which file tab (`Changes`/`AllFiles`) currently occupies the diff/file fields. Tracked
-    /// apart from `tab` so the `PR` tab can be active while a file tab's state stays frozen in
-    /// place, with the other file tab in the stash.
+    /// apart from `tab` so a non-file workspace can be active while a file tab's state stays
+    /// frozen in place, with the other file tab in the stash.
     active_file_tab: Tab,
     pub focus: Focus,
     /// The navigator's source for the active tab: changed files in `Changes`, the whole
@@ -853,6 +887,7 @@ impl App {
             commit_pick: None,
             pick_status: None,
             commit_picker: None,
+            history: HistoryView::default(),
             base_epoch: 0,
             scope,
             tab: Tab::Changes,
@@ -2261,6 +2296,13 @@ impl App {
             self.request_pr_refresh(RefreshKind::Ambient);
             return Ok(());
         }
+        // History owns one full-width, read-only graph. Reload it on entry so branch and commit
+        // changes made while another workspace was open are visible immediately.
+        if tab == Tab::History {
+            self.focus = Focus::Diff;
+            self.refresh_history();
+            return Ok(());
+        }
         // Entering a file tab: bring its state into the diff fields if the other file tab holds
         // them (a Changes↔AllFiles switch, or a return from PR onto the stashed tab).
         if self.active_file_tab != tab {
@@ -2280,6 +2322,88 @@ impl App {
         self.settle_tab_entry();
         self.reveal_files = true; // pull the restored cursor back into view
         Ok(())
+    }
+
+    // ---- History tab ---------------------------------
+
+    /// Reload the bounded all-ref graph, preserving the selected commit when it remains in the
+    /// window. A local git failure leaves the previous graph readable and reports the error in the
+    /// status line; an unborn/non-repository directory is a clean empty state.
+    pub fn refresh_history(&mut self) {
+        if !git::is_repo(&self.repo) {
+            self.history = HistoryView::default();
+            return;
+        }
+        let selected = self.history.selected_sha().map(str::to_owned);
+        let Ok(lines) = git::list_history(&self.repo, HISTORY_LIMIT).map_err(|e| {
+            self.status = e.to_string();
+        }) else {
+            return;
+        };
+        self.history.lines = lines;
+        self.history.cursor = selected
+            .as_deref()
+            .and_then(|sha| {
+                self.history
+                    .lines
+                    .iter()
+                    .position(|line| line.commit.as_ref().is_some_and(|commit| commit.sha == sha))
+            })
+            .unwrap_or_else(|| self.history.first_commit());
+        self.history.reveal = true;
+    }
+
+    /// Move by commit rows, skipping graph-only connector lines.
+    pub fn history_move(&mut self, delta: isize) {
+        if self.history.commit_count() == 0 || delta == 0 {
+            return;
+        }
+        let forward = delta > 0;
+        for _ in 0..delta.unsigned_abs() {
+            let next = if forward {
+                self.history
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .skip(self.history.cursor.saturating_add(1))
+                    .find(|(_, line)| line.commit.is_some())
+                    .map(|(i, _)| i)
+            } else {
+                self.history.lines[..self.history.cursor.min(self.history.lines.len())]
+                    .iter()
+                    .rposition(|line| line.commit.is_some())
+            };
+            let Some(next) = next else { break };
+            self.history.cursor = next;
+        }
+        self.history.reveal = true;
+    }
+
+    /// Select a commit graph line by its physical row. Connector-only rows are inert.
+    pub fn history_goto(&mut self, row: usize) {
+        if self.history.lines.get(row).is_some_and(|line| line.commit.is_some()) {
+            self.history.cursor = row;
+            self.history.reveal = true;
+        }
+    }
+
+    /// Reveal the selected graph line with the smallest possible viewport movement.
+    pub fn reveal_history_cursor(&mut self, viewport: usize) {
+        let heights = vec![1; self.history.lines.len()];
+        self.history.scroll =
+            keep_in_view(self.history.cursor, self.history.scroll, &heights, viewport);
+    }
+
+    /// Clamp the graph viewport so wheel scrolling never leaves a blank tail.
+    pub fn bound_history_scroll(&mut self, viewport: usize) {
+        self.history.scroll = bound(self.history.scroll, self.history.lines.len(), viewport);
+    }
+
+    /// Scroll the graph without moving its selected commit.
+    pub fn wheel_history(&mut self, delta: isize) {
+        if !self.history.lines.is_empty() {
+            self.history.scroll = offset_by(self.history.scroll, delta);
+        }
     }
 
     /// An empty read pane — a first visit landing on a collapsed tree, or an open file gone
@@ -4081,7 +4205,7 @@ impl App {
         }
         self.close_search();
         // Opening is a deliberate leave: the origin tab stashes its place on the switch,
-        // kept for `1`/`2`/`3`.
+        // kept for `1`/`2`.
         if self.tab != Tab::AllFiles {
             self.set_tab(Tab::AllFiles)?;
         }
@@ -4209,6 +4333,20 @@ impl App {
                 };
             }
             Mode::Normal => {}
+        }
+
+        // The read-only History workspace has no authoring or file actions. Its compact primary
+        // advertises movement (or refresh for an empty history); the expanded bands keep only the
+        // actions that operate here.
+        if self.tab == Tab::History {
+            let mut out = if self.history.commit_count() == 0 {
+                vec![(A::Refresh, Primary)]
+            } else {
+                vec![(A::MoveLine, Primary), (A::Refresh, Do), (A::MovePage, Move)]
+            };
+            out.push((A::Tabs, Go));
+            out.push((A::Quit, Go));
+            return out;
         }
 
         // The read-only PR tab: the state summary leads row 1 (rendered separately); `o open` is the

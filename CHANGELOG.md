@@ -4,6 +4,25 @@ All notable changes to Diple are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-10
+
+### Added
+
+- Read-only History workspace on `3`, with a bounded all-ref commit graph, decorations, authors,
+  relative dates, keyboard navigation, mouse navigation, and refresh-in-place.
+
+### Changed
+
+- Refined the interface with neutral pane borders, background-free header and footer chrome, and
+  clearer file-tree hierarchy.
+- Replaced the muddy neutral active-row fill with a clean, theme-aware cool-blue highlight while
+  keeping text selection visually distinct.
+- Compact tab labels automatically on narrow terminals so scope and commit identity remain visible.
+
+### Removed
+
+- Pull-request and merge-request workspace from the public tab bar, keymap, and footer hints.
+
 ## [0.2.1] - 2026-09-09
 
 ### Added

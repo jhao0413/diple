@@ -1329,6 +1329,25 @@ pub enum CommitRef {
     Branch(String),
 }
 
+/// One display line from `git log --graph`. A commit line carries metadata after its graph
+/// prefix; connector-only lines preserve the topology between commits.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HistoryLine {
+    pub graph: String,
+    pub commit: Option<HistoryCommit>,
+}
+
+/// The metadata painted beside one commit in the History workspace.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HistoryCommit {
+    pub sha: String,
+    pub subject: String,
+    pub time: u64,
+    pub author: String,
+    /// Human-facing decorations, including the checked-out branch and `HEAD` marker.
+    pub decorations: Vec<String>,
+}
+
 impl CommitRef {
     pub fn label(&self) -> String {
         match self {
@@ -1359,6 +1378,75 @@ pub fn list_commits(repo: &Path, merge_base: Option<&str>) -> Result<Vec<CommitR
     }
     let out = git(repo, &args)?;
     Ok(parse_commit_log(&out))
+}
+
+/// The recent repository graph across every local and remote ref. `HEAD` is named explicitly so
+/// a detached commit remains visible even when no ref points at it. The commit bound keeps entry
+/// and refresh latency predictable; topology-only connector lines do not count against it.
+pub fn list_history(repo: &Path, limit: usize) -> Result<Vec<HistoryLine>> {
+    let max = format!("--max-count={limit}");
+    let mut args = vec![
+        "log",
+        "--graph",
+        "--date-order",
+        "--decorate=full",
+        max.as_str(),
+        "--format=%x1e%H%x00%s%x00%ct%x00%an%x00%D",
+        "--all",
+    ];
+    if head_oid(repo).is_some() {
+        args.push("HEAD");
+    }
+    let out = git(repo, &args)?;
+    Ok(parse_history_log(&out))
+}
+
+/// Parse graph output one physical line at a time. The record separator starts commit metadata;
+/// lines without it are git's lane joins/splits and remain in the view as topology.
+fn parse_history_log(out: &str) -> Vec<HistoryLine> {
+    out.lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            if let Some((graph, record)) = line.split_once('\x1e') {
+                let fields: Vec<&str> = record.split('\0').collect();
+                if fields.len() != 5 || fields[0].is_empty() {
+                    return None;
+                }
+                return Some(HistoryLine {
+                    graph: graph.to_string(),
+                    commit: Some(HistoryCommit {
+                        sha: fields[0].to_string(),
+                        subject: fields[1].to_string(),
+                        time: fields[2].trim().parse().unwrap_or(0),
+                        author: fields[3].to_string(),
+                        decorations: history_decorations(fields[4]),
+                    }),
+                });
+            }
+            (!line.trim().is_empty()).then(|| HistoryLine { graph: line.to_string(), commit: None })
+        })
+        .collect()
+}
+
+fn history_decorations(value: &str) -> Vec<String> {
+    value
+        .split(", ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if let Some(branch) = value.strip_prefix("HEAD -> refs/heads/") {
+                format!("HEAD → {branch}")
+            } else if let Some(tag) = value.strip_prefix("tag: refs/tags/") {
+                format!("tag: {tag}")
+            } else if let Some(remote) = value.strip_prefix("refs/remotes/") {
+                remote.to_string()
+            } else if let Some(branch) = value.strip_prefix("refs/heads/") {
+                branch.to_string()
+            } else {
+                value.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Parse `git log --format=%H%x00%s%x00%ct%x00%an%x00%D%x00%P -z` output: six NUL-separated
@@ -1629,11 +1717,32 @@ fn parse_name_status(out: &str) -> Vec<(ChangeKind, String, Option<String>)> {
 mod tests {
     use super::{
         ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
-        parse_name_status, parse_numstat, parse_status_codes,
+        parse_history_log, parse_name_status, parse_numstat, parse_status_codes,
     };
     use crate::model::StatusCode;
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
+
+    #[test]
+    fn history_log_keeps_graph_connectors_and_cleans_decorations() {
+        let out = concat!(
+            "* \x1eaaaaaaaa\0tip\01600000000\0Ann\0HEAD -> refs/heads/main, ",
+            "refs/remotes/origin/main, tag: refs/tags/v1\n",
+            "| * \x1ebbbbbbbb\0side\01500000000\0Bob\0refs/heads/side\n",
+            "|/  \n",
+            "* \x1ecccccccc\0root\01400000000\0Cat\0\n",
+        );
+        let rows = parse_history_log(out);
+        assert_eq!(rows.len(), 4);
+        let tip = rows[0].commit.as_ref().unwrap();
+        assert_eq!(rows[0].graph, "* ");
+        assert_eq!(tip.subject, "tip");
+        assert_eq!(tip.decorations, ["HEAD → main", "origin/main", "tag: v1"]);
+        assert_eq!(rows[1].graph, "| * ");
+        assert_eq!(rows[2].graph, "|/  ");
+        assert!(rows[2].commit.is_none(), "the lane join stays as a topology-only row");
+        assert_eq!(rows[3].commit.as_ref().unwrap().author, "Cat");
+    }
 
     #[test]
     fn porcelain_status_keeps_both_columns_and_rename_targets() {

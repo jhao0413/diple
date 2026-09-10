@@ -5,7 +5,7 @@ mod common;
 
 use anyhow::{Result, bail};
 use common::{Repo, app_on, enter_tab, typed};
-use diple::app::{App, Band, Focus, FooterAction, Mode};
+use diple::app::{App, Band, Focus, FooterAction, Mode, Tab};
 use diple::config::NavigatorPosition;
 use diple::export::ExportTarget;
 use diple::file_list::{ListGroup, RowKind};
@@ -3315,6 +3315,45 @@ fn rebound_keys_dispatch_and_replaced_defaults_go_inert() {
 
     press(&mut app, &keymap, KeyCode::Char('ㅊ'));
     assert!(app.composing(), "the bound key opens the composer");
+}
+
+#[test]
+fn three_opens_history_and_its_keys_navigate_and_refresh_without_authoring() {
+    let r = Repo::init();
+    r.write("root.rs", "root\n");
+    r.commit_all("root");
+    r.write("one.rs", "one\n");
+    r.commit_all("one");
+    r.write("two.rs", "two\n");
+    r.commit_all("two");
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+
+    press(&mut app, &keymap, KeyCode::Char('3'));
+    assert_eq!(app.tab, Tab::History);
+    assert_eq!(app.history.commit_count(), 3);
+    let newest = app.history.selected_sha().unwrap().to_string();
+    press(&mut app, &keymap, KeyCode::Char('j'));
+    let selected = app.history.selected_sha().unwrap().to_string();
+    assert_ne!(selected, newest, "j moves to the next commit, not a connector row");
+
+    // Review actions are inert in this read-only workspace.
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    press(&mut app, &keymap, KeyCode::Char('c'));
+    press(&mut app, &keymap, KeyCode::Char('s'));
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.store.is_empty());
+    assert!(r.git(&["status", "--porcelain"]).is_empty());
+
+    // A refresh sees the new tip but preserves the selected commit by oid.
+    r.write("three.rs", "three\n");
+    r.commit_all("three");
+    press(&mut app, &keymap, KeyCode::Char('r'));
+    assert_eq!(app.history.commit_count(), 4);
+    assert_eq!(app.history.selected_sha(), Some(selected.as_str()));
+
+    press(&mut app, &keymap, KeyCode::Char('1'));
+    assert_eq!(app.tab, Tab::Changes);
 }
 
 #[test]

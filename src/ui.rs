@@ -45,6 +45,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     let p = panes(area, app);
 
+    if app.tab == Tab::History {
+        render_history_header(frame, app, p.tab);
+        render_history(frame, app, p.body);
+        render_footer(frame, app, p.status);
+        return;
+    }
+
     // The search screen replaces the body; the header and footer chrome stay
     if app.mode == Mode::Search {
         if app.tab == Tab::Pr {
@@ -1359,11 +1366,16 @@ pub fn hit_header(area: Rect, app: &App, keymap: &Keymap, col: u16, row: u16) ->
     if row != area.y {
         return None;
     }
-    let spans = tab_spans(keymap);
+    let spans = tab_spans(keymap, area.width);
     for &(tab, start, end) in &spans {
         if (start as u16..end as u16).contains(&col) {
             return Some(HeaderHit::Tab(tab));
         }
+    }
+    // History paints only its tab strip and count; do not leave phantom scope/base click targets
+    // in the rest of that header row.
+    if app.tab == Tab::History {
+        return None;
     }
     let prefix = header_prefix_len(&spans);
     let scope_start = prefix as u16;
@@ -1385,14 +1397,19 @@ pub fn hit_header(area: Rect, app: &App, keymap: &Keymap, col: u16, row: u16) ->
     None
 }
 
-/// The three tabs and their labels, left to right, each led by its `tab-*` action's hint key
+/// The three local-workspace tabs and their labels, each led by its `tab-*` action's hint key.
+/// Narrow headers keep only those key labels, reserving the scarce width for scope/commit identity.
 /// Column math uses display width, since a bound hint key can be wide.
-fn tab_labels(keymap: &Keymap) -> [(Tab, String); 3] {
+fn tab_labels(keymap: &Keymap, width: u16) -> [(Tab, String); 3] {
     use crate::keymap::Action as K;
+    let label = |action, name: &str| {
+        let key = keymap.hint(action).label();
+        if width < 96 { key } else { format!("{key} {name}") }
+    };
     [
-        (Tab::Changes, format!("{} Changes", keymap.hint(K::TabChanges).label())),
-        (Tab::AllFiles, format!("{} Files", keymap.hint(K::TabAllFiles).label())),
-        (Tab::Pr, format!("{} PR", keymap.hint(K::TabPr).label())),
+        (Tab::Changes, label(K::TabChanges, "Changes")),
+        (Tab::AllFiles, label(K::TabAllFiles, "Files")),
+        (Tab::History, label(K::TabHistory, "History")),
     ]
 }
 const HEADER_LEAD: &str = " ";
@@ -1414,10 +1431,10 @@ fn indicator_glyph(app: &App) -> &'static str {
 
 /// Each tab's `(tab, start_col, end_col)` in the header, the single source the bar paints and
 /// the click hit-tests against.
-fn tab_spans(keymap: &Keymap) -> Vec<(Tab, usize, usize)> {
+fn tab_spans(keymap: &Keymap, width: u16) -> Vec<(Tab, usize, usize)> {
     let mut col = HEADER_LEAD.len();
     let mut out = Vec::new();
-    for (i, (tab, label)) in tab_labels(keymap).iter().enumerate() {
+    for (i, (tab, label)) in tab_labels(keymap, width).iter().enumerate() {
         if i > 0 {
             col += TAB_GAP.len();
         }
@@ -1500,7 +1517,7 @@ fn pick_label(app: &App) -> Option<(String, String, String, String)> {
 fn base_parts(app: &App, keymap: &Keymap, width: u16) -> Option<(String, String, String)> {
     let (lead, shown, marker, tail) = base_label(app)?;
     // Everything else on the line plus the base's own gap and the suffix's minimum gap.
-    let fixed = header_prefix_len(&tab_spans(keymap))
+    let fixed = header_prefix_len(&tab_spans(keymap, width))
         + scope_chip(app).len()
         + BASE_GAP.len()
         + lead.width()
@@ -1547,11 +1564,11 @@ fn header_suffix(app: &App) -> String {
 /// The header's shared left side, painted by both tab bars: the lead pad, the three tab labels
 /// (the active one bright + underlined, the inactive ones at `SUBTEXT0`), and the trailing gap
 /// before each header's own suffix. One source so the two headers can't drift.
-fn tab_bar_spans(app: &App) -> Vec<Span<'static>> {
+fn tab_bar_spans(app: &App, width: u16) -> Vec<Span<'static>> {
     let p = app.palette();
-    let bar = Style::default().bg(p.surface0);
+    let bar = Style::default();
     let mut spans = vec![Span::styled(HEADER_LEAD, bar)];
-    for (i, (tab, label)) in tab_labels(app.keymap()).into_iter().enumerate() {
+    for (i, (tab, label)) in tab_labels(app.keymap(), width).into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(TAB_GAP, bar));
         }
@@ -1577,17 +1594,17 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         BASE_GAP.len() + lead.width() + name.width() + tail.width()
     });
     let suffix = header_suffix(app);
-    let prefix = header_prefix_len(&tab_spans(app.keymap()));
+    let prefix = header_prefix_len(&tab_spans(app.keymap(), area.width));
     // The suffix keeps the same edge pad as the tab strip's lead.
     let used = prefix + chip.len() + base_width + suffix.width() + HEADER_LEAD.len();
     // Right-align the suffix; at least one gap column when the bar overflows.
     let pad = (area.width as usize).saturating_sub(used).max(1);
 
-    // A quiet surface bar: the active tab in bright blue, the inactive one dimmed, the
-    // clickable scope control accented so it reads as a button.
+    // A background-free strip: the active tab is bright blue, the inactive one dimmed, and the
+    // clickable scope control accented so hierarchy comes from text rather than a color band.
     let p = app.palette();
-    let bar = Style::default().bg(p.surface0);
-    let mut spans = tab_bar_spans(app);
+    let bar = Style::default();
+    let mut spans = tab_bar_spans(app, area.width);
     spans.push(Span::styled(chip, bar.fg(p.yellow).add_modifier(Modifier::BOLD)));
     if let Some((lead, name, tail)) = base {
         // An empty lead is the `no base` state, worn as a warning, except in `commits`,
@@ -1609,10 +1626,152 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     let stats = stats_spans(added, removed, p);
     if !stats.is_empty() {
         spans.push(Span::styled("  ", bar));
-        spans.extend(stats.into_iter().map(|s| Span::styled(s.content, s.style.bg(p.surface0))));
+        spans.extend(stats);
     }
     spans.push(Span::styled(HEADER_LEAD, bar));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// History's quiet header: the shared tab strip and a right-anchored graph summary, without the
+/// file workspaces' scope/base controls.
+fn render_history_header(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let count = app.history.commit_count();
+    let suffix = if count == crate::app::HISTORY_LIMIT {
+        format!("latest {count} commits · all refs")
+    } else {
+        format!("{count} commits · all refs")
+    };
+    let prefix = header_prefix_len(&tab_spans(app.keymap(), area.width));
+    let pad =
+        (area.width as usize).saturating_sub(prefix + suffix.width() + HEADER_LEAD.len()).max(1);
+    let mut spans = tab_bar_spans(app, area.width);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(suffix, Style::default().fg(p.dim2)));
+    spans.push(Span::raw(HEADER_LEAD));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+const HISTORY_SHA_W: usize = 7;
+const HISTORY_AGE_W: usize = 3;
+
+/// Color each graph lane consistently by terminal column; the commit node is warmer so it remains
+/// visible where several connectors cross.
+fn history_graph_spans(graph: &str, p: &Palette) -> Vec<Span<'static>> {
+    let lanes = [p.blue, p.purple, p.green, p.orange];
+    graph
+        .chars()
+        .enumerate()
+        .map(|(column, ch)| {
+            let color = if ch == '*' { p.yellow } else { lanes[(column / 2) % lanes.len()] };
+            Span::styled(ch.to_string(), Style::default().fg(color))
+        })
+        .collect()
+}
+
+fn history_author_width(app: &App) -> usize {
+    const CAP: usize = 18;
+    app.history
+        .lines
+        .iter()
+        .filter_map(|line| line.commit.as_ref())
+        .map(|commit| commit.author.width())
+        .max()
+        .unwrap_or(0)
+        .min(CAP)
+}
+
+/// The full-width, read-only repository graph.
+fn render_history(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let block = bordered("Repository graph", true, p);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.history.commit_count() == 0 {
+        frame.render_widget(dim_paragraph("no commits yet", p), inner);
+        return;
+    }
+
+    let width = inner.width as usize;
+    let author_w = history_author_width(app);
+    let now = now_unix();
+    let items = app
+        .history
+        .lines
+        .iter()
+        .enumerate()
+        .skip(app.history.scroll)
+        .take(inner.height as usize)
+        .map(|(i, line)| {
+            let mut spans = history_graph_spans(&line.graph, p);
+            let Some(commit) = &line.commit else {
+                return ListItem::new(Line::from(spans));
+            };
+
+            let graph_w = line.graph.width();
+            let sha = git::abbreviate_oid(&commit.sha);
+            spans.push(Span::styled(
+                format!("{sha:<HISTORY_SHA_W$}  "),
+                Style::default().fg(p.blue),
+            ));
+
+            // Keep the subject useful first. On a wide terminal, decorations take at most half
+            // its lane and author/age align at the right edge; narrow views drop the metadata tail.
+            let tail_w =
+                if width >= 56 && author_w > 0 { 2 + author_w + 2 + HISTORY_AGE_W } else { 0 };
+            let middle_room = width.saturating_sub(graph_w + HISTORY_SHA_W + 2 + tail_w);
+            let raw_decorations = if commit.decorations.is_empty() {
+                String::new()
+            } else {
+                format!("({}) ", commit.decorations.join(", "))
+            };
+            let decoration = truncate_width(&raw_decorations, middle_room / 2);
+            let subject =
+                truncate_width(&commit.subject, middle_room.saturating_sub(decoration.width()));
+            spans.push(Span::styled(decoration.clone(), Style::default().fg(p.green)));
+            spans.push(Span::styled(subject.clone(), text_style(p)));
+
+            if tail_w > 0 {
+                let author = truncate_width(&commit.author, author_w);
+                let used =
+                    graph_w + HISTORY_SHA_W + 2 + decoration.width() + subject.width() + tail_w;
+                let pad = width.saturating_sub(used) + 2 + author_w.saturating_sub(author.width());
+                let age = age_label(now.saturating_sub(commit.time));
+                spans.push(Span::styled(
+                    format!("{}{author}  {age:>HISTORY_AGE_W$}", " ".repeat(pad)),
+                    Style::default().fg(p.dim2),
+                ));
+            }
+            selectable_row(p, spans, width, (i == app.history.cursor).then_some(p.focus_bg))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), inner);
+    let max_scroll = app.history.lines.len().saturating_sub(inner.height as usize);
+    render_overflow_scrollbar(frame, area, max_scroll, app.history.scroll.min(max_scroll), p);
+}
+
+/// The History graph's content rectangle and viewport height, shared by paint, scroll, and hit
+/// testing so border offsets cannot drift.
+#[must_use]
+pub fn history_inner_rect(area: Rect, app: &App) -> Rect {
+    bordered("Repository graph", true, app.palette()).inner(body_rect(area, app))
+}
+
+#[must_use]
+pub fn history_viewport_height(area: Rect, app: &App) -> usize {
+    history_inner_rect(area, app).height as usize
+}
+
+/// The commit graph row under the pointer; topology-only connector rows are inert.
+#[must_use]
+pub fn hit_history_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
+    let inner = history_inner_rect(area, app);
+    if !contains(inner, col, row) {
+        return None;
+    }
+    let index = app.history.scroll + usize::from(row - inner.y);
+    app.history.lines.get(index)?.commit.as_ref()?;
+    Some(index)
 }
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -1646,7 +1805,7 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
             let nest = "  ".repeat(row.depth);
             match &row.kind {
                 RowKind::Group { label, count } => {
-                    let style = Style::default().fg(p.dim1).add_modifier(Modifier::BOLD);
+                    let style = Style::default().fg(p.dim0).add_modifier(Modifier::BOLD);
                     selectable_row(
                         p,
                         vec![Span::styled(format!("{label} {count}"), style)],
@@ -1660,10 +1819,10 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                     let name_style = if row.ignored {
                         Style::default().fg(p.dim2)
                     } else {
-                        Style::default().fg(p.dim0).add_modifier(Modifier::BOLD)
+                        text_style(p).add_modifier(Modifier::BOLD)
                     };
                     let spans = vec![
-                        Span::styled(format!("{nest}{arrow}"), Style::default().fg(p.dim2)),
+                        Span::styled(format!("{nest}{arrow}"), Style::default().fg(p.dim1)),
                         Span::styled(format!("{}/", row.name), name_style),
                     ];
                     selectable_row(p, spans, width, fill)
@@ -2841,9 +3000,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
         A::Refresh => (hint(K::Refresh), "refresh"),
-        A::Tabs => {
-            (format!("{}·{}·{}", hint(K::TabChanges), hint(K::TabAllFiles), hint(K::TabPr)), "tabs")
-        }
+        A::Tabs => (
+            format!("{}·{}·{}", hint(K::TabChanges), hint(K::TabAllFiles), hint(K::TabHistory)),
+            "tabs",
+        ),
         A::Quit => (hint(K::Quit), "quit"),
     };
     (k, l.into())
@@ -2907,10 +3067,9 @@ const MORE_ELLIPSIS: usize = 2;
 /// `?`-expansion bands below when it is open. Row 1 trims trailing actions to fit; the primary,
 /// `send`, and `?` never drop, and the bands are capped so the body keeps its rows.
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let p = app.palette();
     let mut lines = footer_lines(app, area.width as usize);
     lines.truncate((area.height as usize).max(1));
-    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(p.surface0)), area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The footer's height for the vertical layout: one row collapsed, one plus the wrapped bands when
@@ -3163,7 +3322,7 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled("  (stale)", Style::default().fg(p.red)));
             }
             // The list overlay is the active modal, so its row reads at full brightness.
-            selectable_row(p, spans, width, (i == app.list_cursor).then_some(p.surface2))
+            selectable_row(p, spans, width, (i == app.list_cursor).then_some(p.focus_bg))
         })
         .collect();
     frame.render_widget(List::new(items), inner);
@@ -3378,7 +3537,7 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(p.dim2),
                 ));
             }
-            selectable_row(p, spans, width, (vi == bp.cursor).then_some(p.surface2))
+            selectable_row(p, spans, width, (vi == bp.cursor).then_some(p.focus_bg))
         })
         .collect();
     frame.render_widget(List::new(items), list_area);
@@ -3570,7 +3729,7 @@ fn render_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(p.dim2),
                 ),
             ];
-            selectable_row(p, spans, width, (i == cp.cursor).then_some(p.surface2))
+            selectable_row(p, spans, width, (i == cp.cursor).then_some(p.focus_bg))
         })
         .collect();
     // A clipped list says so, like the search screen's results.
@@ -3835,7 +3994,7 @@ fn render_search_results(
             }
             SearchRow::File(i) => {
                 let hit = &s.results.files[*i];
-                let fill = (s.pick == *i).then_some(p.surface2);
+                let fill = (s.pick == *i).then_some(p.focus_bg);
                 file_row_item(
                     &FileRowSpec {
                         indent: "",
@@ -3851,7 +4010,7 @@ fn render_search_results(
             }
             SearchRow::Code(i) => {
                 let hit = &s.results.code[*i];
-                let fill = (s.pick == *i).then_some(p.surface2);
+                let fill = (s.pick == *i).then_some(p.focus_bg);
                 search_code_row(hit, width, fill, p)
             }
         })
@@ -4171,7 +4330,7 @@ fn text_style(p: &Palette) -> Style {
     Style::default().fg(p.text)
 }
 
-/// A list row, highlighted with the shared selection fill (`surface2` + bold, full
+/// A list row, highlighted with the shared cursor fill (cool tint + bold, full
 /// width) when `selected` — the same treatment the diff cursor uses, so every cursor
 /// in the UI reads the same. The fill is applied per span (with a trailing pad) so it
 /// spans the full width under the `List` widget, matching the diff's `Paragraph` rows.
@@ -4211,8 +4370,8 @@ fn selectable_row(
 /// with the PR title right-aligned to its left. Merge/sync/checks live in the footer.
 fn render_pr_header(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
-    let bar = Style::default().bg(p.surface0);
-    let mut spans = tab_bar_spans(app);
+    let bar = Style::default();
+    let mut spans = tab_bar_spans(app, area.width);
     let lead_tabs: usize = spans.iter().map(Span::width).sum();
     let w = area.width as usize;
 
@@ -4783,12 +4942,18 @@ fn check_glyph(p: &Palette, status: forge::CheckStatus) -> (&'static str, Color)
 // --- helpers -------------------------------------------------------------------
 
 fn bordered(title: &str, focused: bool, p: &Palette) -> Block<'static> {
-    // A focused pane gets a blue border; an unfocused one recedes to a surface tone.
-    let color = if focused { p.blue } else { p.surface2 };
+    // Like Lumen's default theme, a neutral outline carries structure while crisp title text
+    // carries focus. No chromatic accent needs to wrap the whole workspace pane.
+    let title_style = if focused {
+        text_style(p).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.dim0)
+    };
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
+        .border_style(Style::default().fg(p.pane_border()))
         .title(framed_title(title))
+        .title_style(title_style)
 }
 
 /// Every block title breathes: one space each side, so the text never touches the border

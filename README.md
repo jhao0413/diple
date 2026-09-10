@@ -15,10 +15,10 @@ particular AI workflow.
 - Stages or unstages the selected file with `a` without modifying the worktree.
 - Reviews a branch against an automatically resolved or manually selected base.
 - Reviews one commit or a contiguous run of commits.
+- Browses a compact, all-branch commit graph with decorations, authors, and relative dates.
 - Adapts wide Changes panes into old/new source columns and keeps narrow panes unified.
 - Adds comments to exact old-side or new-side line ranges.
 - Browses and searches the whole repository, with syntax highlighting and Markdown preview.
-- Shows a read-only pull-request or merge-request view when `gh`, `glab`, or `az` is available.
 - Copies a review to the clipboard, or confirms and writes it to stdout for another command.
 
 ## Install
@@ -79,7 +79,7 @@ Press `q` to quit without emitting anything. Press `y` to copy comments without 
 | --- | --- |
 | `j` / `k`, `↑` / `↓` | Move |
 | `tab` | Switch between navigator and reader |
-| `1` / `2` / `3` | Changes / all files / pull request |
+| `1` / `2` / `3` | Changes / all files / history graph |
 | `u` / `b` / `g` | Uncommitted / branch / commits scope |
 | `B` / `G` | Pick a branch base / commit range |
 | `a` | Stage or unstage the selected file |
@@ -107,8 +107,8 @@ A path edited on both sides appears once in each section, and each row opens onl
 diff. `a` moves the selected path across the index boundary.
 
 `branch` compares the worktree with the merge base of a selected base branch. Diple tries the
-explicit `--base`, a saved per-worktree choice, the pull request target, the configured upstream,
-`origin/HEAD`, and common default branch names.
+explicit `--base`, a saved per-worktree choice, the configured upstream, `origin/HEAD`, and common
+default branch names.
 
 `commits` lets you pick one commit or a contiguous range and compares the first commit's parent
 with the newest selected commit.

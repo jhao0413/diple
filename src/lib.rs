@@ -1027,6 +1027,11 @@ fn event_loop(terminal: &mut DipleTerminal, app: &mut App, cfg: &Config, kbd: bo
                 app.reveal_file_cursor(file_vp);
             }
             app.bound_file_scroll(file_vp);
+            let history_vp = ui::history_viewport_height(area, app);
+            if std::mem::take(&mut app.history.reveal) {
+                app.reveal_history_cursor(history_vp);
+            }
+            app.bound_history_scroll(history_vp);
             let painted_frame = PaintedFrameSnapshot::capture(app);
             terminal.draw(|f| ui::render(f, app))?;
 
@@ -1790,6 +1795,28 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         return Ok(());
     }
 
+    // The History workspace is a read-only graph with its own cursor and scroll. Its small
+    // dispatcher keeps file-review actions inert and makes `r` an immediate local graph reload.
+    if app.tab == crate::app::Tab::History {
+        match (action, key.code) {
+            (Some(K::Quit), _) => app.should_quit = true,
+            (Some(K::Refresh), _) => app.refresh_history(),
+            (Some(K::TabChanges), _) => app.set_tab(crate::app::Tab::Changes)?,
+            (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
+            (Some(K::TabHistory), _) => {}
+            (Some(K::Down), _) => app.history_move(1),
+            (Some(K::Up), _) => app.history_move(-1),
+            (Some(K::PageDown), _) => app.history_move(PAGE),
+            (Some(K::PageUp), _) => app.history_move(-PAGE),
+            (Some(K::HalfDown), _) => app.history_move(HALF_PAGE),
+            (Some(K::HalfUp), _) => app.history_move(-HALF_PAGE),
+            (Some(K::Keys), _) => app.toggle_keys(),
+            (_, Esc) => app.escape(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // The read-only PR tab: navigate the snapshot and open links; authoring actions are inert.
     if app.tab == crate::app::Tab::Pr {
         match (action, key.code) {
@@ -1800,6 +1827,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             }
             (Some(K::TabChanges), _) => app.set_tab(crate::app::Tab::Changes)?,
             (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
+            (Some(K::TabHistory), _) => app.set_tab(crate::app::Tab::History)?,
             (Some(K::OpenPr), _) => app.pr_open(),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
@@ -1846,7 +1874,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             }
             K::TabChanges => app.set_tab(crate::app::Tab::Changes)?,
             K::TabAllFiles => app.set_tab(crate::app::Tab::AllFiles)?,
-            K::TabPr => app.set_tab(crate::app::Tab::Pr)?,
+            K::TabHistory => app.set_tab(crate::app::Tab::History)?,
             K::Down => app.move_cursor(1)?,
             K::Up => app.move_cursor(-1)?,
             // `expand`/`collapse` act on the collapsible under the cursor — a directory in the
@@ -1933,7 +1961,7 @@ fn handle_resize(app: &mut App) {
 /// on text.
 fn handle_text_down(app: &mut App, m: MouseEvent, area: Rect) -> bool {
     use crate::selection::{Gesture, Point, Surface, TextDrag};
-    let file_tab = app.tab != crate::app::Tab::Pr;
+    let file_tab = app.tab.is_file_tab();
     let arm = |app: &mut App, surface: Surface, point: Point| {
         let count = app.note_click(m.column, m.row, point.row);
         app.gesture =
@@ -2450,6 +2478,25 @@ pub fn handle_mouse(
             MouseEventKind::Up(MouseButton::Left) if app.divider_drag_captured() => {
                 app.finish_divider_drag();
             }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // History has one full-width list and no divider or text-selection surface.
+    if app.tab == crate::app::Tab::History {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(ui::HeaderHit::Tab(tab)) =
+                    ui::hit_header(area, app, keymap, m.column, m.row)
+                {
+                    app.set_tab(tab)?;
+                } else if let Some(row) = ui::hit_history_row(area, app, m.column, m.row) {
+                    app.history_goto(row);
+                }
+            }
+            MouseEventKind::ScrollDown => app.wheel_history(3),
+            MouseEventKind::ScrollUp => app.wheel_history(-3),
             _ => {}
         }
         return Ok(());

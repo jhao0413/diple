@@ -15,6 +15,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 
 fn dump(buffer: &Buffer) -> String {
     let area = buffer.area;
@@ -50,8 +51,8 @@ fn render_size(app: &App, width: u16, height: u16) -> Buffer {
     terminal.backend().buffer().clone()
 }
 
-/// Catppuccin surface2 — the shared selection/cursor fill.
-const SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x58, 0x5b, 0x70);
+/// Catppuccin's restrained cool-blue focused cursor fill.
+const FOCUSED_CURSOR_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x2a, 0x2e, 0x58);
 /// Catppuccin orange — the comment-editor caret block.
 const PEACH: ratatui::style::Color = ratatui::style::Color::Rgb(0xfa, 0xb3, 0x87);
 
@@ -672,7 +673,10 @@ fn the_diff_cursor_row_is_marked_from_either_pane() {
             .count()
     };
 
-    assert!(fill(&app, SELECTION_BG) > 10, "the focused diff fills its cursor row with surface2");
+    assert!(
+        fill(&app, FOCUSED_CURSOR_BG) > 10,
+        "the focused diff fills its cursor row with the clean cool tint"
+    );
 
     app.focus = Focus::Files;
     assert!(
@@ -689,9 +693,9 @@ fn the_selected_file_row_fills_with_the_shared_selection_color() {
     let files = ui::files_inner_rect(AREA, &app);
     let selected_y = 2 + u16::try_from(app.file_cursor).unwrap();
     let selected = (files.x..files.x + files.width)
-        .filter(|&x| buf.cell((x, selected_y)).is_some_and(|c| c.bg == SELECTION_BG))
+        .filter(|&x| buf.cell((x, selected_y)).is_some_and(|c| c.bg == FOCUSED_CURSOR_BG))
         .count();
-    assert!(selected > 10, "the selected file row fills wide with surface2: {selected} cells");
+    assert!(selected > 10, "the selected file row fills wide with the cool tint: {selected} cells");
 }
 
 #[test]
@@ -703,7 +707,7 @@ fn a_hidden_navigator_gives_the_read_pane_the_whole_body() {
     let fill = |app: &App| {
         let buf = render_buffer(app);
         (1..139u16)
-            .filter(|&x| buf.cell((x, cursor_y)).is_some_and(|c| c.bg == SELECTION_BG))
+            .filter(|&x| buf.cell((x, cursor_y)).is_some_and(|c| c.bg == FOCUSED_CURSOR_BG))
             .count()
     };
     let visible_fill = fill(&app);
@@ -741,6 +745,32 @@ fn shows_tab_bar_file_list_and_diff() {
     assert!(out.contains("hello.rs"), "file appears in the list");
     assert!(out.contains("BETA"), "diff content is rendered");
     assert!(out.contains("changed"), "the header shows the changed count");
+    assert!(out.lines().next().unwrap().contains("3 History"), "history is the third tab");
+    assert!(!out.lines().next().unwrap().contains("PR"), "the removed PR tab stays absent");
+}
+
+#[test]
+fn headers_and_footers_keep_the_terminal_background() {
+    let mut app = edited_app();
+    app.toggle_keys();
+
+    for tab in [Tab::Changes, Tab::AllFiles, Tab::History] {
+        app.set_tab(tab).unwrap();
+        let buf = render_buffer(&app);
+        let body = ui::body_rect(AREA, &app);
+        let footer_y = body.y + body.height;
+
+        for x in 0..AREA.width {
+            assert_eq!(buf.cell((x, 0)).unwrap().bg, Color::Reset, "{tab:?} header at {x}");
+            for y in footer_y..AREA.height {
+                assert_eq!(
+                    buf.cell((x, y)).unwrap().bg,
+                    Color::Reset,
+                    "{tab:?} footer at ({x}, {y})"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1370,7 +1400,7 @@ fn navigator_layout_rects_cover_every_position_and_tiny_axis() {
 }
 
 #[test]
-fn pr_focus_border_tracks_tab_between_navigator_and_read_pane() {
+fn pr_pane_borders_stay_neutral_while_focus_moves_between_titles() {
     let mut app = edited_app();
     app.set_tab(Tab::Pr).unwrap();
     app.focus = Focus::Files;
@@ -1381,17 +1411,30 @@ fn pr_focus_border_tracks_tab_between_navigator_and_read_pane() {
     let read_x = (body.x..body.x + body.width)
         .find(|&x| ui::in_diff_pane(AREA, &app, x, body.y + 4))
         .unwrap();
-    let (blue, surface2) = (app.palette().blue, app.palette().surface2);
+    let nav_inner = ui::files_inner_rect(AREA, &app);
+    let read_inner = ui::read_inner_rect(AREA, &app);
+    let nav_title = (nav_inner.x + 1, nav_inner.y - 1);
+    let read_title = (read_inner.x + 1, read_inner.y - 1);
+    let (text, dim0, border) =
+        (app.palette().text, app.palette().dim0, app.palette().pane_border());
 
     let focused_nav = render_buffer(&app);
-    assert_eq!(focused_nav.cell((nav_x, body.y + 4)).unwrap().fg, blue);
-    assert_eq!(focused_nav.cell((read_x, body.y + 4)).unwrap().fg, surface2);
+    assert_eq!(focused_nav.cell((nav_x, body.y + 4)).unwrap().fg, border);
+    assert_eq!(focused_nav.cell((read_x, body.y + 4)).unwrap().fg, border);
+    assert_eq!(focused_nav.cell(nav_title).unwrap().fg, text);
+    assert!(focused_nav.cell(nav_title).unwrap().modifier.contains(Modifier::BOLD));
+    assert_eq!(focused_nav.cell(read_title).unwrap().fg, dim0);
+    assert!(!focused_nav.cell(read_title).unwrap().modifier.contains(Modifier::BOLD));
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), AREA, &Keymap::default())
         .unwrap();
     let focused_read = render_buffer(&app);
-    assert_eq!(focused_read.cell((nav_x, body.y + 4)).unwrap().fg, surface2);
-    assert_eq!(focused_read.cell((read_x, body.y + 4)).unwrap().fg, blue);
+    assert_eq!(focused_read.cell((nav_x, body.y + 4)).unwrap().fg, border);
+    assert_eq!(focused_read.cell((read_x, body.y + 4)).unwrap().fg, border);
+    assert_eq!(focused_read.cell(nav_title).unwrap().fg, dim0);
+    assert!(!focused_read.cell(nav_title).unwrap().modifier.contains(Modifier::BOLD));
+    assert_eq!(focused_read.cell(read_title).unwrap().fg, text);
+    assert!(focused_read.cell(read_title).unwrap().modifier.contains(Modifier::BOLD));
 }
 
 #[test]
@@ -1544,7 +1587,7 @@ fn renders_a_light_theme_without_panic() {
     let mut app = edited_app();
     app.set_cli_theme(Some("catppuccin-latte".to_string()));
     // Driving the full render path with a derived light palette must not panic, and a Latte
-    // color (the focused pane's blue border) reaches the painted buffer.
+    // accent (including the active tab) reaches the painted buffer.
     let buf = render_buffer(&app);
     let latte_blue = diple::theme::resolve(Some("catppuccin-latte")).palette.blue;
     let painted = (0..40)
@@ -1567,13 +1610,12 @@ fn rebound_app(keybindings: &str) -> App {
 
 #[test]
 fn hints_show_the_first_bound_key() {
-    let app = rebound_app("comment = [\"ㅊ\", \"c\"]\ntab-pr = [\"x\"]\n");
+    let mut app = rebound_app("comment = [\"ㅊ\", \"c\"]\n");
+    app.toggle_keys();
     let out = render(&app);
-    let footer = footer_line(&out);
     // A wide hint key spans two buffer cells, so the dump carries a placeholder space after it.
-    assert!(footer.contains("ㅊ  comment"), "the hint is the first bound key:\n{footer}");
-    assert!(out.contains("x PR"), "the header tab hint follows its binding:\n{out}");
-    assert!(!out.contains("3 PR"), "the replaced digit is gone:\n{out}");
+    assert!(out.contains("ㅊ  comment"), "the hint is the first bound key:\n{out}");
+    assert!(out.contains("1·2·3 tabs"), "the footer lists all three local tabs:\n{out}");
 }
 
 /// The header columns `hit_header` maps to `tab` under `keymap`, scanned instead of hardcoded
@@ -1590,7 +1632,7 @@ fn header_hits_use_the_frame_keymap_not_the_live_one() {
     use diple::keymap::default_keymap;
     // The live keymap has a wide tab-changes hint, shifting every span right by one column.
     let app = rebound_app("tab-changes = [\"ㅊ\"]\n");
-    for tab in [Tab::Changes, Tab::AllFiles, Tab::Pr] {
+    for tab in [Tab::Changes, Tab::AllFiles, Tab::History] {
         assert_ne!(
             tab_hit_cols(&app, default_keymap(), tab),
             tab_hit_cols(&app, app.keymap(), tab),
@@ -1610,7 +1652,8 @@ fn header_tab_hits_align_with_wide_hint_keys() {
     let row0 = out.lines().next().unwrap().to_string();
     let col_of = |needle: &str| row0[..row0.find(needle).unwrap()].chars().count() as u16;
     let area = Rect::new(0, 0, 140, 40);
-    for (needle, tab) in [("Changes", Tab::Changes), ("2 Files", Tab::AllFiles), ("3 PR", Tab::Pr)]
+    for (needle, tab) in
+        [("Changes", Tab::Changes), ("2 Files", Tab::AllFiles), ("3 History", Tab::History)]
     {
         assert_eq!(
             ui::hit_header(area, &app, app.keymap(), col_of(needle), 0),
@@ -1618,6 +1661,108 @@ fn header_tab_hits_align_with_wide_hint_keys() {
             "the drawn {needle:?} label answers its own click"
         );
     }
+}
+
+/// A merge-shaped repository for the History workspace: the graph must retain both commit rows
+/// and git's connector-only lane join.
+fn history_app() -> (Repo, App) {
+    let r = Repo::init();
+    r.write("root.rs", "root\n");
+    r.commit_all("root");
+    r.git(&["checkout", "-q", "-b", "side"]);
+    r.write("side.rs", "side\n");
+    r.commit_all("side work");
+    r.git(&["checkout", "-q", "main"]);
+    r.write("main.rs", "main\n");
+    r.commit_all("main work");
+    r.git(&["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+    let mut app = app_on(&r);
+    app.set_tab(Tab::History).unwrap();
+    (r, app)
+}
+
+#[test]
+fn history_paints_an_all_ref_graph_with_clear_metadata_and_selection() {
+    let (_r, mut app) = history_app();
+    let buf = render_buffer(&app);
+    let out = dump(&buf);
+    let header = out.lines().next().unwrap();
+    assert!(header.contains("3 History"), "the third tab is visible: {header}");
+    assert!(header.contains("4 commits · all refs"), "the graph count is explicit: {header}");
+    assert!(!header.contains("[uncommitted]"), "history has no file-review scope: {header}");
+    assert!(out.contains("Repository graph"), "the body names the graph:\n{out}");
+    for subject in ["merge side", "main work", "side work", "root"] {
+        assert!(out.contains(subject), "missing {subject:?}:\n{out}");
+    }
+    assert!(out.contains("HEAD → main"), "the checked-out ref is decorated:\n{out}");
+    assert!(
+        app.history.lines.iter().any(|line| line.commit.is_none()),
+        "git's merge connector is retained"
+    );
+    let inner = ui::history_inner_rect(AREA, &app);
+    assert_eq!(
+        buf.cell((inner.x, inner.y)).unwrap().bg,
+        FOCUSED_CURSOR_BG,
+        "the selected commit uses the clean focused fill"
+    );
+
+    app.toggle_keys();
+    let expanded = render(&app);
+    assert!(expanded.contains("1·2·3 tabs") && expanded.contains("r refresh"));
+    for absent in ["scope", "comment", "stage", "search", "open ↗"] {
+        assert!(!expanded.contains(absent), "History must not offer {absent:?}:\n{expanded}");
+    }
+}
+
+#[test]
+fn history_hit_testing_selects_commits_but_not_connector_rows() {
+    let (_r, mut app) = history_app();
+    let inner = ui::history_inner_rect(AREA, &app);
+    let commit = app
+        .history
+        .lines
+        .iter()
+        .position(|line| line.commit.as_ref().is_some_and(|c| c.subject == "side work"))
+        .unwrap();
+    let connector = app.history.lines.iter().position(|line| line.commit.is_none()).unwrap();
+    assert_eq!(ui::hit_history_row(AREA, &app, inner.x, inner.y + commit as u16), Some(commit));
+    assert_eq!(ui::hit_history_row(AREA, &app, inner.x, inner.y + connector as u16), None);
+    let keymap = Keymap::default();
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+            column: inner.x,
+            row: inner.y + commit as u16,
+            modifiers: KeyModifiers::NONE,
+        },
+        AREA,
+        &[],
+        &keymap,
+        &diple::export::Clipboard,
+    )
+    .unwrap();
+    assert_eq!(app.history.cursor, commit);
+
+    // A keyboard move crosses the connector but lands only on the next commit.
+    let before = (0..connector).rev().find(|&i| app.history.lines[i].commit.is_some()).unwrap();
+    let after = (connector + 1..app.history.lines.len())
+        .find(|&i| app.history.lines[i].commit.is_some())
+        .unwrap();
+    app.history_goto(before);
+    app.history_move(1);
+    assert_eq!(app.history.cursor, after);
+}
+
+#[test]
+fn an_unborn_history_workspace_has_a_clean_empty_state() {
+    let r = Repo::init();
+    let mut app = app_on(&r);
+    app.set_tab(Tab::History).unwrap();
+    let out = render(&app);
+    assert!(out.contains("0 commits · all refs"), "{out}");
+    assert!(out.contains("no commits yet"), "{out}");
+    assert!(!out.contains("PR"), "the old workspace does not return:\n{out}");
 }
 
 #[test]

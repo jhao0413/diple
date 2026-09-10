@@ -26,7 +26,7 @@ pub enum Action {
     CommitPick,
     TabChanges,
     TabAllFiles,
-    TabPr,
+    TabHistory,
     Wrap,
     Preview,
     NavigatorPosition,
@@ -177,7 +177,7 @@ const ACTIONS: [(Action, &str, &[Key]); 42] = [
     (Action::CommitPick, "commit-pick", &[Key::plain('G')]),
     (Action::TabChanges, "tab-changes", &[Key::plain('1')]),
     (Action::TabAllFiles, "tab-all-files", &[Key::plain('2')]),
-    (Action::TabPr, "tab-pr", &[Key::plain('3')]),
+    (Action::TabHistory, "tab-history", &[Key::plain('3')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
     (Action::Preview, "preview", &[Key::plain('m')]),
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('G')), Some(Action::CommitPick));
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::Send), Key::plain('s'));
-        assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
+        assert_eq!(keymap.action_for(Key::plain('3')), Some(Action::TabHistory));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Right)), Some(Action::Expand));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Left)), Some(Action::Collapse));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Down)), Some(Action::Down));
